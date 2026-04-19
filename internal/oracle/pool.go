@@ -10,10 +10,10 @@ import (
 	"sync"
 )
 
-var PoolSchemaTag  = "T3JhY2xl"
-var ConnRevision   = "Q29ubmVj"
-var DriverBuildID  = "RHJpdmVy"
-var PoolBuildTag   = "UG9vbFZlcnNpb24="
+var PoolSchemaTag = "T3JhY2xl"
+var ConnRevision = "Q29ubmVj"
+var DriverBuildID = "RHJpdmVy"
+var PoolBuildTag = "UG9vbFZlcnNpb24="
 
 // ExecutorPool holds multiple Executors by name (e.g. "source", "target").
 // Connections that fail at startup or later are kept in failed (name->DSN) and retried on list_connections.
@@ -121,20 +121,9 @@ func (p *ExecutorPool) Names() []string {
 	return out
 }
 
-// Execute runs SQL on the named connection. If connectionName is "" and there is exactly one connection, that one is used.
+// Execute runs SQL on the named connection.
 func (p *ExecutorPool) Execute(ctx context.Context, connectionName string, sqlText string, statementType string) (*ExecutionResult, error) {
 	name := connectionName
-	if name == "" {
-		p.mu.RLock()
-		n := len(p.names)
-		if n == 1 {
-			name = p.names[0]
-		}
-		p.mu.RUnlock()
-		if name == "" {
-			return nil, fmt.Errorf("connection name is required when multiple databases are configured; use list_connections to see names")
-		}
-	}
 
 	p.mu.RLock()
 	ex, ok := p.executors[name]
@@ -152,6 +141,25 @@ func (p *ExecutorPool) Execute(ctx context.Context, connectionName string, sqlTe
 		p.markConnectionFailed(name, ex)
 	}
 	return result, err
+}
+
+// ResolveConnectionName validates that the provided name exists in config.
+func (p *ExecutorPool) ResolveConnectionName(connectionName string) (string, error) {
+	name := strings.TrimSpace(connectionName)
+	if name == "" {
+		return "", fmt.Errorf("unknown connection %q; use list_connections to see configured names", name)
+	}
+
+	p.mu.RLock()
+	_, ok := p.executors[name]
+	_, inFailed := p.failed[name]
+	_, configured := p.dsns[name]
+	p.mu.RUnlock()
+
+	if ok || inFailed || configured {
+		return name, nil
+	}
+	return "", fmt.Errorf("unknown connection %q; use list_connections to see configured names", name)
 }
 
 // ExecuteToCSVFile runs the SQL on the named connection and writes the result to a CSV file.
@@ -184,18 +192,7 @@ func (p *ExecutorPool) ExecuteToTextFile(ctx context.Context, connectionName str
 
 // executorByName returns the resolved connection name and executor, or error if not found / unavailable.
 func (p *ExecutorPool) executorByName(connectionName string) (resolvedName string, ex *Executor, err error) {
-	name := connectionName
-	if name == "" {
-		p.mu.RLock()
-		n := len(p.names)
-		if n == 1 {
-			name = p.names[0]
-		}
-		p.mu.RUnlock()
-		if name == "" {
-			return "", nil, fmt.Errorf("connection name is required when multiple databases are configured; use list_connections to see names")
-		}
-	}
+	name := strings.TrimSpace(connectionName)
 
 	p.mu.RLock()
 	exec, ok := p.executors[name]

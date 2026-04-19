@@ -302,7 +302,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		Tools: []tool{
 			{
 				Name:        "execute_sql",
-				Description: "Execute SQL against an Oracle database. When multiple databases are configured (e.g. source and target), use the 'connection' argument to choose which one (call list_connections to see names). Supports SELECT, INSERT, UPDATE, DELETE, DDL (CREATE, DROP, ALTER, etc.), and multiple statements. Multiple statements: one per line, each line ending with a semicolon. DDL is auto-committed. SQL that matches config danger_keywords will open a confirmation window showing the full SQL. Do not specify schema-qualified object names such as hr.employees.",
+				Description: "Execute SQL against an Oracle database. Always pass the 'connection' argument with a configured connection name (call list_connections to see names). Supports SELECT, INSERT, UPDATE, DELETE, DDL (CREATE, DROP, ALTER, etc.), and multiple statements. Multiple statements: one per line, each line ending with a semicolon. DDL is auto-committed. SQL that matches config danger_keywords will open a confirmation window showing the full SQL. Do not specify schema-qualified object names such as hr.employees.",
 				InputSchema: inputSchema{
 					Type: "object",
 					Properties: map[string]property{
@@ -312,7 +312,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use (e.g. 'database1', 'database2'). Required when multiple connections are configured; use list_connections to see names. Omit when only one connection is configured.",
+							Description: "Which configured database to use (e.g. 'database1', 'database2'). Required for every call; use list_connections to see names.",
 						},
 					},
 					Required: []string{"sql"},
@@ -330,7 +330,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use. Required when multiple connections are configured; omit when only one is configured.",
+							Description: "Which configured database to use. Required for every call; use list_connections to see names.",
 						},
 					},
 					Required: []string{"file_path"},
@@ -361,7 +361,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use. Required when multiple connections; omit when only one.",
+							Description: "Which configured database to use. Required for every call; use list_connections to see names.",
 						},
 					},
 					Required: []string{"sql", "file_path"},
@@ -383,7 +383,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use. Required when multiple connections; omit when only one.",
+							Description: "Which configured database to use. Required for every call; use list_connections to see names.",
 						},
 					},
 					Required: []string{"sql", "file_path"},
@@ -611,20 +611,16 @@ func (s *Server) handleExecuteSQL(req *jsonRPCRequest, args map[string]interface
 		return
 	}
 
-	// Optional: which configured connection to use (when multiple DBs are configured)
 	connectionName := ""
 	if c, ok := args["connection"]; ok && c != nil {
 		if cs, ok := c.(string); ok {
 			connectionName = strings.TrimSpace(cs)
 		}
 	}
-	// For display/audit: when only one connection is configured, use its name instead of empty
-	displayConnection := connectionName
-	if displayConnection == "" {
-		names := s.executorPool.Names()
-		if len(names) == 1 {
-			displayConnection = names[0]
-		}
+	displayConnection, err := s.executorPool.ResolveConnectionName(connectionName)
+	if err != nil {
+		s.sendToolError(req.ID, err.Error())
+		return
 	}
 
 	review, ok := s.tryConfirmDangerousSQL(req, sql, displayConnection, "")
@@ -706,12 +702,10 @@ func (s *Server) handleExecuteSQLFile(req *jsonRPCRequest, args map[string]inter
 			connectionName = strings.TrimSpace(cs)
 		}
 	}
-	displayConnection := connectionName
-	if displayConnection == "" {
-		names := s.executorPool.Names()
-		if len(names) == 1 {
-			displayConnection = names[0]
-		}
+	displayConnection, err := s.executorPool.ResolveConnectionName(connectionName)
+	if err != nil {
+		s.sendToolError(req.ID, err.Error())
+		return
 	}
 
 	review, ok := s.tryConfirmDangerousSQL(req, sql, displayConnection, "File: "+filePath)
@@ -799,18 +793,10 @@ func (s *Server) handleQueryToCSVFile(req *jsonRPCRequest, args map[string]inter
 			connectionName = strings.TrimSpace(cs)
 		}
 	}
-	displayConnection := connectionName
-	if displayConnection == "" {
-		names := s.executorPool.Names()
-		if len(names) == 1 {
-			displayConnection = names[0]
-		} else if len(names) > 1 {
-			s.sendToolError(req.ID, "Multiple connections configured; specify 'connection' (call list_connections for names).")
-			return
-		}
-	}
-	if displayConnection == "" {
-		displayConnection = "default"
+	displayConnection, err := s.executorPool.ResolveConnectionName(connectionName)
+	if err != nil {
+		s.sendToolError(req.ID, err.Error())
+		return
 	}
 
 	review, ok := s.tryConfirmDangerousSQL(req, sqlStr, displayConnection, "CSV output: "+filePath)
@@ -822,11 +808,7 @@ func (s *Server) handleQueryToCSVFile(req *jsonRPCRequest, args map[string]inter
 	rowsWritten, err := s.executorPool.ExecuteToCSVFile(ctx, connectionName, sqlStr, filePath)
 	if err != nil {
 		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_CSV_ERROR: "+err.Error(), displayConnection, reviewHeaderLineOption(review))
-		if strings.Contains(strings.ToLower(err.Error()), "unavailable") || strings.Contains(strings.ToLower(err.Error()), "connection") {
-			s.sendToolError(req.ID, "Connection is currently unavailable; call list_connections to retry.")
-		} else {
-			s.sendToolError(req.ID, "query_to_csv_file failed: "+err.Error())
-		}
+		s.sendToolError(req.ID, "query_to_csv_file failed: "+err.Error())
 		return
 	}
 
@@ -880,18 +862,10 @@ func (s *Server) handleQueryToTextFile(req *jsonRPCRequest, args map[string]inte
 			connectionName = strings.TrimSpace(cs)
 		}
 	}
-	displayConnection := connectionName
-	if displayConnection == "" {
-		names := s.executorPool.Names()
-		if len(names) == 1 {
-			displayConnection = names[0]
-		} else if len(names) > 1 {
-			s.sendToolError(req.ID, "Multiple connections configured; specify 'connection' (call list_connections for names).")
-			return
-		}
-	}
-	if displayConnection == "" {
-		displayConnection = "default"
+	displayConnection, err := s.executorPool.ResolveConnectionName(connectionName)
+	if err != nil {
+		s.sendToolError(req.ID, err.Error())
+		return
 	}
 
 	review, ok := s.tryConfirmDangerousSQL(req, sqlStr, displayConnection, "Text output: "+filePath)
@@ -903,11 +877,7 @@ func (s *Server) handleQueryToTextFile(req *jsonRPCRequest, args map[string]inte
 	rowsWritten, err := s.executorPool.ExecuteToTextFile(ctx, connectionName, sqlStr, filePath)
 	if err != nil {
 		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_TEXT_ERROR: "+err.Error(), displayConnection, reviewHeaderLineOption(review))
-		if strings.Contains(strings.ToLower(err.Error()), "unavailable") || strings.Contains(strings.ToLower(err.Error()), "connection") {
-			s.sendToolError(req.ID, "Connection is currently unavailable; call list_connections to retry.")
-		} else {
-			s.sendToolError(req.ID, "query_to_text_file failed: "+err.Error())
-		}
+		s.sendToolError(req.ID, "query_to_text_file failed: "+err.Error())
 		return
 	}
 
