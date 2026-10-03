@@ -14,6 +14,7 @@ type Entry struct {
 	Connection string   `json:"connection"`
 	HeadLine   []string `json:"head_line"`
 	Keyword    []string `json:"keyword:"`
+	Prefix     []string `json:"prefix,omitempty"`
 }
 
 // Store manages whitelist.json persistence.
@@ -41,7 +42,8 @@ func (s *Store) Path() string {
 	return s.path
 }
 
-// ContainsHeadLine reports whether the exact connection + head_line pair already exists.
+// ContainsHeadLine reports whether the connection + head_line pair already exists,
+// using case-insensitive matching for the headline text.
 func (s *Store) ContainsHeadLine(connection, headerLine string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -55,7 +57,7 @@ func (s *Store) ContainsHeadLine(connection, headerLine string) (bool, error) {
 			continue
 		}
 		for _, line := range entry.HeadLine {
-			if line == headerLine {
+			if strings.EqualFold(line, headerLine) {
 				return true, nil
 			}
 		}
@@ -63,7 +65,8 @@ func (s *Store) ContainsHeadLine(connection, headerLine string) (bool, error) {
 	return false, nil
 }
 
-// AddHeadLine inserts the exact connection + head_line pair if it does not already exist.
+// AddHeadLine inserts the connection + head_line pair if it does not already exist,
+// using case-insensitive matching to avoid duplicate entries that differ only by case.
 func (s *Store) AddHeadLine(connection, headerLine string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -74,7 +77,7 @@ func (s *Store) AddHeadLine(connection, headerLine string) error {
 	}
 	entry := findOrCreateEntry(&entries, connection)
 	for _, line := range entry.HeadLine {
-		if line == headerLine {
+		if strings.EqualFold(line, headerLine) {
 			return nil
 		}
 	}
@@ -99,6 +102,63 @@ func (s *Store) AddKeyword(connection, keyword string) error {
 	}
 	entry.Keyword = append(entry.Keyword, keyword)
 	return s.saveLocked(entries)
+}
+
+// AddPrefix inserts a prefix for the given connection if it does not already exist (case-insensitive).
+func (s *Store) AddPrefix(connection, prefix string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	entry := findOrCreateEntry(&entries, connection)
+	for _, existing := range entry.Prefix {
+		if strings.EqualFold(existing, prefix) {
+			return nil
+		}
+	}
+	entry.Prefix = append(entry.Prefix, prefix)
+	return s.saveLocked(entries)
+}
+
+// ContainsMatchingPrefix reports whether any saved prefix for the connection matches
+// the beginning of the normalized SQL (newlines removed, multiple spaces collapsed).
+func (s *Store) ContainsMatchingPrefix(connection, sql string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := s.loadLocked()
+	if err != nil {
+		return false, err
+	}
+	normalizedSQL := normalizeSQL(sql)
+	for _, entry := range entries {
+		if entry.Connection != connection {
+			continue
+		}
+		for _, prefix := range entry.Prefix {
+			if prefix == "" {
+				continue
+			}
+			if strings.HasPrefix(normalizedSQL, normalizeSQL(prefix)) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// normalizeSQL collapses newlines and multiple spaces into a single space for prefix matching.
+func normalizeSQL(sql string) string {
+	sql = strings.ReplaceAll(sql, "\r\n", " ")
+	sql = strings.ReplaceAll(sql, "\r", " ")
+	sql = strings.ReplaceAll(sql, "\n", " ")
+	for strings.Contains(sql, "  ") {
+		sql = strings.ReplaceAll(sql, "  ", " ")
+	}
+	return strings.TrimSpace(sql)
 }
 
 // ContainsKeywordCI reports whether the exact keyword exists for the given connection, case-insensitively.
@@ -170,6 +230,13 @@ func (s *Store) loadLocked() ([]Entry, error) {
 				return nil, fmt.Errorf("parse whitelist keyword in %s: %w", s.path, err)
 			}
 			entry.Keyword = appendUniqueStrings(entry.Keyword, keywords...)
+		}
+		if msg, ok := raw["prefix"]; ok {
+			var prefixes []string
+			if err := json.Unmarshal(msg, &prefixes); err != nil {
+				return nil, fmt.Errorf("parse whitelist prefix in %s: %w", s.path, err)
+			}
+			entry.Prefix = appendUniqueStrings(entry.Prefix, prefixes...)
 		}
 	}
 	return entries, nil

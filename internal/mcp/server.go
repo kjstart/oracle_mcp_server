@@ -468,6 +468,23 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 				expandedKeywords: nil,
 			}, true
 		}
+		prefixAllowed, err := s.whitelist.ContainsMatchingPrefix(connectionKey, sql)
+		if err != nil {
+			s.logAudit(sql, analysis.MatchedKeywords, audit.ApprovalRejected, "WHITELIST_ERROR: "+err.Error(), displayConnection, nil)
+			s.sendToolError(req.ID, fmt.Sprintf("Whitelist read error: %v", err))
+			return nil, false
+		}
+		if prefixAllowed {
+			return &reviewDecision{
+				analysis:         analysis,
+				stmtType:         stmtType,
+				approval:         audit.ApprovalWhitelist,
+				headerLine:       headerLine,
+				logHeaderLine:    false,
+				auditKeywords:    analysis.MatchedKeywords,
+				expandedKeywords: nil,
+			}, true
+		}
 		unresolvedKeywords, unresolvedMatches, allKeywordMatchesAllowed, allowedExpandedKeywords, err := s.filterWhitelistedKeywords(connectionKey, sql, analysis.MatchedKeywords)
 		if err != nil {
 			s.logAudit(sql, analysis.MatchedKeywords, audit.ApprovalRejected, "WHITELIST_ERROR: "+err.Error(), displayConnection, nil)
@@ -519,16 +536,8 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 		}
 
 		approval := audit.ApprovalApproved
-		if confirmResult.AllowHeader {
-			if s.whitelist == nil {
-				s.sendToolError(req.ID, "Whitelist is not available")
-				return nil, false
-			}
-			if err := s.whitelist.AddHeadLine(connectionKey, headerLine); err != nil {
-				s.logAudit(sql, analysis.MatchedKeywords, audit.ApprovalRejected, "WHITELIST_ERROR: "+err.Error(), displayConnection, nil)
-				s.sendToolError(req.ID, fmt.Sprintf("Whitelist write error: %v", err))
-				return nil, false
-			}
+		if confirmResult.AllowPrefix {
+			// Prefix already saved to whitelist.json by the dialog
 			approval = audit.ApprovalWhitelist
 		}
 
@@ -537,7 +546,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 			stmtType:         stmtType,
 			approval:         approval,
 			headerLine:       headerLine,
-			logHeaderLine:    confirmResult.AllowHeader,
+			logHeaderLine:    false,
 			auditKeywords:    analysis.MatchedKeywords,
 			expandedKeywords: analysisForHighlight,
 		}, true
@@ -572,16 +581,8 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 	}
 
 	approval := audit.ApprovalApproved
-	if confirmResult.AllowHeader {
-		if s.whitelist == nil {
-			s.sendToolError(req.ID, "Whitelist is not available")
-			return nil, false
-		}
-		if err := s.whitelist.AddHeadLine(connectionKey, headerLine); err != nil {
-			s.logAudit(sql, analysis.MatchedKeywords, audit.ApprovalRejected, "WHITELIST_ERROR: "+err.Error(), displayConnection, nil)
-			s.sendToolError(req.ID, fmt.Sprintf("Whitelist write error: %v", err))
-			return nil, false
-		}
+	if confirmResult.AllowPrefix {
+		// Prefix already saved to whitelist.json by the dialog
 		approval = audit.ApprovalWhitelist
 	}
 
@@ -590,7 +591,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 		stmtType:         stmtType,
 		approval:         approval,
 		headerLine:       headerLine,
-		logHeaderLine:    confirmResult.AllowHeader,
+		logHeaderLine:    false,
 		auditKeywords:    analysis.MatchedKeywords,
 		expandedKeywords: nil,
 	}, true

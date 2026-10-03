@@ -68,7 +68,7 @@ type ConfirmRequest struct {
 // ConfirmResult reports how the review dialog was approved.
 type ConfirmResult struct {
 	Approved    bool
-	AllowHeader bool
+	AllowPrefix bool
 }
 
 // Confirmer handles user confirmation dialogs.
@@ -161,8 +161,8 @@ func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
 	switch s {
 	case "1":
 		return ConfirmResult{Approved: true}, nil
-	case "allow_header":
-		return ConfirmResult{Approved: true, AllowHeader: true}, nil
+	case "allow_prefix":
+		return ConfirmResult{Approved: true, AllowPrefix: true}, nil
 	default:
 		return ConfirmResult{}, nil
 	}
@@ -523,10 +523,18 @@ function Normalize-WhitelistEntry($entry) {
 		}
 	}
 
+	$prefixes = @()
+	if ($null -ne $entry.PSObject.Properties['prefix']) {
+		foreach ($value in @($entry.'prefix')) {
+			$prefixes += [string]$value
+		}
+	}
+
 	return [ordered]@{
 		connection = [string]$entry.connection
 		head_line  = @($headLines)
 		'keyword:' = @($keywords)
+		prefix     = @($prefixes)
 	}
 }
 
@@ -567,6 +575,51 @@ function Save-WhitelistKeyword([string]$path, [string]$connectionName, [string]$
 	}
 	if (-not $exists) {
 		$entry.'keyword:' += $keyword
+	}
+
+	$json = $items | ConvertTo-Json -Depth 5
+	$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+	[System.IO.File]::WriteAllText($path, $json + [Environment]::NewLine, $utf8NoBom)
+}
+
+function Save-WhitelistPrefix([string]$path, [string]$connectionName, [string]$prefix) {
+	$items = @()
+	if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path $path)) {
+		$raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8).Trim()
+		if ($raw -ne '') {
+			$parsed = ConvertFrom-Json -InputObject $raw
+			foreach ($item in @($parsed)) {
+				$items += ,(Normalize-WhitelistEntry $item)
+			}
+		}
+	}
+
+	$entry = $null
+	foreach ($item in $items) {
+		if ([string]::Equals([string]$item.connection, $connectionName, [System.StringComparison]::Ordinal)) {
+			$entry = $item
+			break
+		}
+	}
+	if ($null -eq $entry) {
+		$entry = [ordered]@{
+			connection = $connectionName
+			head_line  = @()
+			'keyword:' = @()
+			prefix     = @()
+		}
+		$items += ,$entry
+	}
+
+	$exists = $false
+	foreach ($existing in @($entry.prefix)) {
+		if ([string]::Equals([string]$existing, $prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+			$exists = $true
+			break
+		}
+	}
+	if (-not $exists) {
+		$entry.prefix += $prefix
 	}
 
 	$json = $items | ConvertTo-Json -Depth 5
@@ -649,17 +702,30 @@ $btnAllowKeyword.Add_Click({
 })
 $form.Controls.Add($btnAllowKeyword)
 
-$btnAllowHeader = New-Object System.Windows.Forms.Button
-$btnAllowHeader.Text = "Allow Header"
-$btnAllowHeader.Location = New-Object System.Drawing.Point(590, 670)
-$btnAllowHeader.Size = New-Object System.Drawing.Size(100, 28)
-$btnAllowHeader.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
-$btnAllowHeader.Add_Click({
-	$form.Tag = "allow_header"
-	$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-	$form.Close()
+$btnAllowPrefix = New-Object System.Windows.Forms.Button
+$btnAllowPrefix.Text = "Allow Prefix"
+$btnAllowPrefix.Location = New-Object System.Drawing.Point(590, 670)
+$btnAllowPrefix.Size = New-Object System.Drawing.Size(100, 28)
+$btnAllowPrefix.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$btnAllowPrefix.Add_Click({
+	if ([string]::IsNullOrWhiteSpace($txtKeyword.Text)) {
+		[System.Windows.Forms.MessageBox]::Show("Please enter a prefix first.", "Allow Prefix", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+		return
+	}
+	if ([string]::IsNullOrWhiteSpace($WhitelistPath)) {
+		[System.Windows.Forms.MessageBox]::Show("Whitelist path is unavailable.", "Allow Prefix", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+		return
+	}
+	try {
+		Save-WhitelistPrefix -path $WhitelistPath -connectionName $WhitelistConnection -prefix $txtKeyword.Text.Trim()
+		$form.Tag = "allow_prefix"
+		$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+		$form.Close()
+	} catch {
+		[System.Windows.Forms.MessageBox]::Show("Failed to update whitelist.json: " + $_.Exception.Message, "Allow Prefix", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+	}
 })
-$form.Controls.Add($btnAllowHeader)
+$form.Controls.Add($btnAllowPrefix)
 
 $btnExecute = New-Object System.Windows.Forms.Button
 $btnExecute.Text = "Execute"
@@ -684,7 +750,7 @@ $form.Controls.SetChildIndex($browser, 1)
 $form.Add_Shown({ $form.ActiveControl = $browser })
 $result = $form.ShowDialog()
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-if ($form.Tag -eq "allow_header") { [IO.File]::WriteAllText($ResultPath, "allow_header", $utf8NoBom) }
+if ($form.Tag -eq "allow_prefix") { [IO.File]::WriteAllText($ResultPath, "allow_prefix", $utf8NoBom) }
 elseif ($result -eq [System.Windows.Forms.DialogResult]::OK) { [IO.File]::WriteAllText($ResultPath, "1", $utf8NoBom) }
 else { [IO.File]::WriteAllText($ResultPath, "0", $utf8NoBom) }
 `

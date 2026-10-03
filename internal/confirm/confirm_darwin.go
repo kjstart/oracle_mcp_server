@@ -35,7 +35,7 @@ type ConfirmRequest struct {
 // ConfirmResult reports how the review dialog was approved.
 type ConfirmResult struct {
 	Approved    bool
-	AllowHeader bool
+	AllowPrefix bool
 }
 
 // Confirmer handles user confirmation dialogs on macOS.
@@ -144,8 +144,8 @@ func parseConfirmResult(value string) (ConfirmResult, bool) {
 	switch value {
 	case "1":
 		return ConfirmResult{Approved: true}, true
-	case "allow_header":
-		return ConfirmResult{Approved: true, AllowHeader: true}, true
+	case "allow_prefix":
+		return ConfirmResult{Approved: true, AllowPrefix: true}, true
 	case "0":
 		return ConfirmResult{}, true
 	default:
@@ -381,8 +381,23 @@ const jxaScript = `
 	      continue;
 	    }
 	    if (response === 3) {
-	      writeResult(resultPath, "allow_header");
-	      return "allow_header";
+	      const trimmed = keywordText.trim();
+	      if (!trimmed) {
+	        app.displayAlert("Allow Prefix", {message: "Please enter a prefix first."});
+	        continue;
+	      }
+	      if (!whitelistPath) {
+	        app.displayAlert("Allow Prefix", {message: "Whitelist path is unavailable."});
+	        continue;
+	      }
+	      try {
+	        saveWhitelistPrefix(whitelistPath, whitelistConnection, trimmed);
+	        writeResult(resultPath, "allow_prefix");
+	        return "allow_prefix";
+	      } catch (error) {
+	        app.displayAlert("Allow Prefix", {message: "Failed to update whitelist.json: " + error});
+	        continue;
+	      }
 	    }
 
     writeResult(resultPath, "0");
@@ -429,7 +444,7 @@ const jxaScript = `
 	  container.addSubview(keywordField);
 
 	  addButton(container, handler, "Allow Keyword", 2, 374, 24, 112);
-	  addButton(container, handler, "Allow Header", 3, 496, 24, 104);
+	  addButton(container, handler, "Allow Prefix", 3, 496, 24, 104);
 	  addButton(container, handler, "Execute", 1, 610, 24, 90);
 	  addButton(container, handler, "Cancel", 0, 710, 24, 90);
 	
@@ -674,7 +689,7 @@ function saveWhitelistKeyword(path, connectionName, keyword) {
     }
   }
   if (!entry) {
-    entry = {connection: String(connectionName), head_line: [], "keyword:": []};
+    entry = {connection: String(connectionName), head_line: [], "keyword:": [], prefix: []};
     items.push(entry);
   }
 
@@ -683,6 +698,41 @@ function saveWhitelistKeyword(path, connectionName, keyword) {
   });
   if (!exists) {
     entry["keyword:"].push(String(keyword));
+  }
+
+  const jsonText = JSON.stringify(items, null, 2) + "\n";
+  ensureParentDirectory(path);
+  const wrote = $(jsonText).writeToFileAtomicallyEncodingError($(path), true, $.NSUTF8StringEncoding, null);
+  if (!wrote) {
+    throw "writeToFile failed for " + path;
+  }
+}
+
+function saveWhitelistPrefix(path, connectionName, prefix) {
+  let items = [];
+  const raw = readTextFile(path).trim();
+  if (raw) {
+    const parsed = JSON.parse(raw);
+    items = parsed.map(normalizeWhitelistEntry);
+  }
+
+  let entry = null;
+  for (let i = 0; i < items.length; i++) {
+    if (String(items[i].connection) === String(connectionName)) {
+      entry = items[i];
+      break;
+    }
+  }
+  if (!entry) {
+    entry = {connection: String(connectionName), head_line: [], "keyword:": [], prefix: []};
+    items.push(entry);
+  }
+
+  const exists = entry.prefix.some(function (item) {
+    return String(item).toLowerCase() === String(prefix).toLowerCase();
+  });
+  if (!exists) {
+    entry.prefix.push(String(prefix));
   }
 
   const jsonText = JSON.stringify(items, null, 2) + "\n";
@@ -709,7 +759,8 @@ function normalizeWhitelistEntry(entry) {
   const normalized = {
     connection: String(entry.connection || ""),
     head_line: [],
-    "keyword:": []
+    "keyword:": [],
+    prefix: []
   };
 
   if (Array.isArray(entry.head_line)) {
@@ -720,6 +771,10 @@ function normalizeWhitelistEntry(entry) {
 
   if (Array.isArray(entry["keyword:"])) {
     normalized["keyword:"] = entry["keyword:"].map(String);
+  }
+
+  if (Array.isArray(entry.prefix)) {
+    normalized.prefix = entry.prefix.map(String);
   }
 
   return normalized;

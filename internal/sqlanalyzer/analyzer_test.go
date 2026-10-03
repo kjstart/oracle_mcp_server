@@ -210,8 +210,12 @@ func TestAnalyzer_Analyze_WholeText(t *testing.T) {
 		{"no keyword", "SELECT * FROM users", false, nil},
 		{"drop as token", "DROP TABLE t", true, []string{"drop"}},
 		{"drop in string literal", "SELECT 'drop table' FROM dual", true, []string{"drop"}},
-		{"create in object name", "SELECT * FROM user_source WHERE name = 'XX_CREATE_TABLE'", true, []string{"create"}},
+		{"create inside object name", "SELECT * FROM user_source WHERE name = 'XX_CREATE_TABLE'", false, nil},
+		{"drop glued to letters", "SELECT fdropck FROM dual", false, nil},
+		{"drop after punctuation", "SELECT 1 FROM t WHERE x REGEXP_LIKE '(DROP|x)'", true, []string{"drop"}},
+		{"drop after quote", "SELECT 'drop' FROM dual", true, []string{"drop"}},
 		{"truncate in comment", "SELECT 1 -- truncate later", true, []string{"truncate"}},
+		{"keyword at end of text", "SELECT * FROM t -- drop", true, []string{"drop"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

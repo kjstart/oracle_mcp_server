@@ -423,17 +423,48 @@ func (a *Analyzer) isDDL(tokens []string) bool {
 	return false
 }
 
-// matchKeywordsWholeText finds all danger keywords as case-insensitive substrings in the full SQL.
-// Any occurrence (in string literals, comments, object names, etc.) triggers a match.
+// matchKeywordsWholeText finds all danger keywords in the full SQL, case-insensitively.
+// The keyword must appear as a standalone word: the characters immediately before and after
+// it must not be identifier characters (letters, digits, _, $, #). So "update" matches in
+// "(UPDATE|" and "'update", but not in "XX_SN_LOA_UPDATE" or "fupdateck".
+// Occurrences in string literals and comments still trigger a match.
 func (a *Analyzer) matchKeywordsWholeText(sql string) []string {
 	lower := strings.ToLower(sql)
 	var matched []string
 	for _, kw := range a.dangerKeywords {
-		if strings.Contains(lower, kw) {
+		if containsKeywordAsWord(lower, kw) {
 			matched = append(matched, kw)
 		}
 	}
 	return matched
+}
+
+// containsKeywordAsWord reports whether keyword occurs in lowerSQL delimited by non-identifier
+// characters (or by the start/end of the text). Both arguments must already be lower-cased.
+func containsKeywordAsWord(lowerSQL, keyword string) bool {
+	if keyword == "" {
+		return false
+	}
+
+	searchFrom := 0
+	for searchFrom <= len(lowerSQL)-len(keyword) {
+		idx := strings.Index(lowerSQL[searchFrom:], keyword)
+		if idx < 0 {
+			return false
+		}
+		idx += searchFrom
+
+		leftOK := idx == 0 || !isKeywordIdentifierChar(rune(lowerSQL[idx-1]))
+		end := idx + len(keyword)
+		rightOK := end == len(lowerSQL) || !isKeywordIdentifierChar(rune(lowerSQL[end]))
+		if leftOK && rightOK {
+			return true
+		}
+
+		searchFrom = idx + 1
+	}
+
+	return false
 }
 
 // matchKeywords finds all danger keywords in the tokens.
