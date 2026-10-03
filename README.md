@@ -109,6 +109,22 @@ logging:
 
 With **one** connection, all SQL runs against that database (no need to pass `connection`). With **multiple** connections, use the `connection` argument in `execute_sql` / `execute_sql_file` and `list_connections` to see names and availability.
 
+**Multiple security profiles:** define named profiles under `security_profiles` (same fields as `security`; omitted fields use built-in defaults) and bind connections to them with `oracle.connection_security`. Connections not listed use the top-level `security` section (profile name `default`, which can also be referenced explicitly). Unknown profile or connection names are rejected at startup.
+
+```yaml
+oracle:
+  connections:
+    prod: "user/pass@//host:1521/PROD"
+    dev: "user/pass@//host:1521/DEV"
+  connection_security:
+    prod: strict
+security_profiles:
+  strict:
+    danger_keyword_match: "tokens"
+    danger_keywords: [drop, delete, update, insert]
+    require_confirm_for_ddl: true
+```
+
 > **Connection security:** On first startup, any plain-text connection strings in `config.yaml` are automatically replaced with encrypted values. The file is updated in place — comments and formatting are preserved.
 
 ### Environment Variables

@@ -132,7 +132,7 @@ const (
 type Server struct {
 	config       *config.Config
 	executorPool *oracle.ExecutorPool
-	analyzer     *sqlanalyzer.Analyzer
+	analyzers    map[string]*sqlanalyzer.Analyzer // connection name -> analyzer built from that connection's security profile
 	confirmer    *confirm.Confirmer
 	auditor      *audit.Auditor
 	whitelist    *reviewwhitelist.Store
@@ -185,10 +185,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to resolve whitelist path: %w", err)
 	}
 
+	analyzers := make(map[string]*sqlanalyzer.Analyzer, len(connections))
+	for name := range connections {
+		sec, _ := cfg.SecurityFor(name)
+		analyzers[name] = sqlanalyzer.NewAnalyzer(sec.DangerKeywords, sec.DangerKeywordMatch)
+	}
+
 	return &Server{
 		config:       cfg,
 		executorPool: executorPool,
-		analyzer:     sqlanalyzer.NewAnalyzer(cfg.Security.DangerKeywords, cfg.Security.DangerKeywordMatch),
+		analyzers:    analyzers,
 		confirmer:    confirm.NewConfirmer(),
 		auditor:      auditor,
 		whitelist:    reviewwhitelist.NewStore(whitelistPath),
@@ -422,7 +428,8 @@ func (s *Server) handleToolsCall(req *jsonRPCRequest) {
 // tryConfirmDangerousSQL runs the same analysis/review flow as execute_sql. sourceLabel is optional (e.g. file or export path).
 // If it returns false, a JSON-RPC error or tool error has already been sent.
 func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnection, sourceLabel string) (*reviewDecision, bool) {
-	analysis := s.analyzer.Analyze(sql)
+	security, _ := s.config.SecurityFor(displayConnection)
+	analysis := s.analyzers[displayConnection].Analyze(sql)
 	stmtType := sqlanalyzer.GetStatementType(sql)
 	headerLine := firstSQLLine(sql)
 	if analysis.HasExplicitSchema {
@@ -433,7 +440,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 		return nil, false
 	}
 	needsConfirmation := analysis.IsDangerous ||
-		(s.config.Security.RequireConfirmForDDL && analysis.IsDDL)
+		(security.RequireConfirmForDDL && analysis.IsDDL)
 	if !needsConfirmation {
 		return &reviewDecision{
 			analysis:         analysis,
@@ -491,7 +498,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 			s.sendToolError(req.ID, fmt.Sprintf("Whitelist read error: %v", err))
 			return nil, false
 		}
-		if allKeywordMatchesAllowed && !(s.config.Security.RequireConfirmForDDL && analysis.IsDDL) {
+		if allKeywordMatchesAllowed && !(security.RequireConfirmForDDL && analysis.IsDDL) {
 			return &reviewDecision{
 				analysis:         analysis,
 				stmtType:         stmtType,
@@ -518,7 +525,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 			WhitelistPath:               whitelistPath(s.whitelist),
 			WhitelistConnection:         connectionKey,
 			ReviewTriggerDetails:        formatReviewTriggerDetails(unresolvedMatches),
-			DangerKeywords:              s.config.Security.DangerKeywords,
+			DangerKeywords:              security.DangerKeywords,
 		}
 		confirmResult, err := s.confirmer.Confirm(confirmReq)
 		if err != nil {
@@ -563,7 +570,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 		SourceLabel:                 sourceLabel,
 		WhitelistPath:               whitelistPath(s.whitelist),
 		WhitelistConnection:         connectionKey,
-		DangerKeywords:              s.config.Security.DangerKeywords,
+		DangerKeywords:              security.DangerKeywords,
 	}
 	confirmResult, err := s.confirmer.Confirm(confirmReq)
 	if err != nil {

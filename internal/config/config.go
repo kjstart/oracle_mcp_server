@@ -12,9 +12,12 @@ import (
 
 // Config represents the root configuration structure.
 type Config struct {
-	Oracle   OracleConfig   `yaml:"oracle"`
+	Oracle OracleConfig `yaml:"oracle"`
+	// Security is the default profile (named "default"); used by connections without an entry in oracle.connection_security.
 	Security SecurityConfig `yaml:"security"`
-	Logging  LoggingConfig  `yaml:"logging"`
+	// SecurityProfiles are named security profiles, referenced from oracle.connection_security.
+	SecurityProfiles map[string]SecurityConfig `yaml:"security_profiles"`
+	Logging          LoggingConfig             `yaml:"logging"`
 
 	// ConfigPath is the path to the loaded config file (set by Load); used to resolve relative paths like audit log.
 	ConfigPath string `yaml:"-"`
@@ -25,13 +28,75 @@ type Config struct {
 // If only one connection is configured, it is used for all SQL (connection argument optional).
 type OracleConfig struct {
 	Connections map[string]string `yaml:"connections"`
+	// ConnectionSecurity maps connection name -> security profile name ("default" or a key of security_profiles).
+	// Connections not listed here use the default profile.
+	ConnectionSecurity map[string]string `yaml:"connection_security"`
 }
+
+// DefaultSecurityProfileName is the profile name of the top-level security section.
+const DefaultSecurityProfileName = "default"
 
 // SecurityConfig holds security-related settings.
 type SecurityConfig struct {
 	DangerKeywords       []string `yaml:"danger_keywords"`
 	DangerKeywordMatch   string   `yaml:"danger_keyword_match"` // "whole_text" (default) or "tokens"
 	RequireConfirmForDDL bool     `yaml:"require_confirm_for_ddl"`
+}
+
+func defaultSecurityConfig() SecurityConfig {
+	return SecurityConfig{
+		DangerKeywords: []string{
+			"truncate",
+			"drop",
+			"alter system",
+			"shutdown",
+			"grant dba",
+			"delete",
+		},
+		DangerKeywordMatch:   "whole_text",
+		RequireConfirmForDDL: true,
+	}
+}
+
+// UnmarshalYAML starts from the built-in defaults so fields omitted in a profile keep their default values.
+func (s *SecurityConfig) UnmarshalYAML(node *yaml.Node) error {
+	type raw SecurityConfig
+	r := raw(defaultSecurityConfig())
+	if err := node.Decode(&r); err != nil {
+		return err
+	}
+	*s = SecurityConfig(r)
+	return nil
+}
+
+// normalize lowercases danger keywords and the match mode.
+func (s *SecurityConfig) normalize() {
+	for i, kw := range s.DangerKeywords {
+		s.DangerKeywords[i] = strings.ToLower(strings.TrimSpace(kw))
+	}
+	s.DangerKeywordMatch = strings.ToLower(strings.TrimSpace(s.DangerKeywordMatch))
+	if s.DangerKeywordMatch == "" {
+		s.DangerKeywordMatch = "whole_text"
+	}
+}
+
+func (s *SecurityConfig) validate(label string) error {
+	if s.DangerKeywordMatch != "whole_text" && s.DangerKeywordMatch != "tokens" {
+		return fmt.Errorf("%s.danger_keyword_match must be \"whole_text\" or \"tokens\", got %q", label, s.DangerKeywordMatch)
+	}
+	return nil
+}
+
+// SecurityFor returns the security settings for the named connection, and the profile name used.
+func (c *Config) SecurityFor(connection string) (SecurityConfig, string) {
+	name, ok := c.Oracle.ConnectionSecurity[connection]
+	if !ok || name == DefaultSecurityProfileName {
+		return c.Security, DefaultSecurityProfileName
+	}
+	if p, ok := c.SecurityProfiles[name]; ok {
+		return p, name
+	}
+	return c.Security, DefaultSecurityProfileName
 }
 
 // LoggingConfig holds logging settings.
@@ -47,18 +112,7 @@ func DefaultConfig() *Config {
 		Oracle: OracleConfig{
 			Connections: nil,
 		},
-		Security: SecurityConfig{
-			DangerKeywords: []string{
-				"truncate",
-				"drop",
-				"alter system",
-				"shutdown",
-				"grant dba",
-				"delete",
-			},
-			DangerKeywordMatch:   "whole_text",
-			RequireConfirmForDDL: true,
-		},
+		Security: defaultSecurityConfig(),
 		Logging: LoggingConfig{
 			AuditLog:       true,
 			VerboseLogging: true,
@@ -110,15 +164,11 @@ func LoadFromFile(path string) (*Config, error) {
 		}
 	}
 
-	// Normalize danger keywords to lowercase
-	for i, kw := range config.Security.DangerKeywords {
-		config.Security.DangerKeywords[i] = strings.ToLower(strings.TrimSpace(kw))
-	}
-	// Default danger keyword match mode (before Validate)
-	if config.Security.DangerKeywordMatch == "" {
-		config.Security.DangerKeywordMatch = "whole_text"
-	} else {
-		config.Security.DangerKeywordMatch = strings.ToLower(strings.TrimSpace(config.Security.DangerKeywordMatch))
+	// Normalize danger keywords / match mode (before Validate)
+	config.Security.normalize()
+	for name, p := range config.SecurityProfiles {
+		p.normalize()
+		config.SecurityProfiles[name] = p
 	}
 
 	if err := config.Validate(); err != nil {
@@ -165,9 +215,27 @@ func (c *Config) Validate() error {
 	if len(c.Oracle.Connections) == 0 {
 		return fmt.Errorf("oracle.connections is required and must have at least one entry")
 	}
-	mode := c.Security.DangerKeywordMatch
-	if mode != "whole_text" && mode != "tokens" {
-		return fmt.Errorf("security.danger_keyword_match must be \"whole_text\" or \"tokens\", got %q", mode)
+	if err := c.Security.validate("security"); err != nil {
+		return err
+	}
+	for name, p := range c.SecurityProfiles {
+		if name == DefaultSecurityProfileName {
+			return fmt.Errorf("security_profiles.%s is reserved for the top-level security section", name)
+		}
+		if err := p.validate("security_profiles." + name); err != nil {
+			return err
+		}
+	}
+	for conn, profile := range c.Oracle.ConnectionSecurity {
+		if _, ok := c.Oracle.Connections[conn]; !ok {
+			return fmt.Errorf("oracle.connection_security: unknown connection %q", conn)
+		}
+		if profile == DefaultSecurityProfileName {
+			continue
+		}
+		if _, ok := c.SecurityProfiles[profile]; !ok {
+			return fmt.Errorf("oracle.connection_security.%s: unknown security profile %q", conn, profile)
+		}
 	}
 	return nil
 }
@@ -220,9 +288,25 @@ func fileExists(path string) bool {
 // formatting. It replaces plain-text DSNs with their encrypted equivalents in-place.
 func encryptConnectionsInPlace(path string, original []byte, encryptedConnections map[string]string) error {
 	lines := strings.Split(string(original), "\n")
+	// Only rewrite inside the "connections:" block, so same-named keys elsewhere
+	// (e.g. security_profiles / connection_security entries) are left untouched.
+	inBlock := false
+	blockIndent := 0
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indentLen := len(line) - len(strings.TrimLeft(line, " \t"))
+		if !inBlock {
+			if strings.TrimSpace(strings.SplitN(trimmed, "#", 2)[0]) == "connections:" {
+				inBlock = true
+				blockIndent = indentLen
+			}
+			continue
+		}
+		if indentLen <= blockIndent {
+			inBlock = false
 			continue
 		}
 		colonIdx := strings.Index(trimmed, ":")

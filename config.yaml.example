@@ -9,6 +9,10 @@ oracle:
   connections:
     database1: "user/pass@//host:1521/ORCL"
 #    database2: "user/pass@//host2:1521/ORCL"
+  # Optional: connection name -> security profile name ("default" or a key of security_profiles).
+  # Connections not listed here use the top-level "security" section.
+#  connection_security:
+#    database2: strict
 # Connection string format: user/password@//host:port/service_name
 
 # Security Settings
@@ -37,6 +41,14 @@ security:
   # If true, all DDL statements (CREATE, DROP, ALTER, etc.) require confirmation
   # even if they don't match danger_keywords
   require_confirm_for_ddl: true
+
+# Optional: named security profiles, same fields as "security". Omitted fields use built-in defaults.
+# Referenced by name from oracle.connection_security. The name "default" is reserved.
+#security_profiles:
+#  strict:
+#    danger_keyword_match: "tokens"
+#    danger_keywords: [drop, delete, update, insert, alter]
+#    require_confirm_for_ddl: true
 
 # Logging Settings
 logging:
