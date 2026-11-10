@@ -199,7 +199,7 @@ func TestAnalyzer_Analyze(t *testing.T) {
 }
 
 func TestAnalyzer_Analyze_WholeText(t *testing.T) {
-	analyzer := NewAnalyzer([]string{"truncate", "drop", "create"}, "whole_text")
+	analyzer := NewAnalyzer([]string{"truncate", "drop", "create", "update"}, "whole_text")
 
 	tests := []struct {
 		name          string
@@ -216,6 +216,10 @@ func TestAnalyzer_Analyze_WholeText(t *testing.T) {
 		{"drop after quote", "SELECT 'drop' FROM dual", true, []string{"drop"}},
 		{"truncate in comment", "SELECT 1 -- truncate later", true, []string{"truncate"}},
 		{"keyword at end of text", "SELECT * FROM t -- drop", true, []string{"drop"}},
+		{"percent on both sides", "SELECT * FROM user_tab_columns WHERE column_name LIKE '%UPDATE%'", false, nil},
+		{"percent before keyword", "SELECT '%UPDATE' FROM dual", false, nil},
+		{"percent after keyword", "SELECT 'UPDATE%' FROM dual", false, nil},
+		{"update statement with percent pattern", "UPDATE t SET name = 'x' WHERE name LIKE '%UPDATE%'", true, []string{"update"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

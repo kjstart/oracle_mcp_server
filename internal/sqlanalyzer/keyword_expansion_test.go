@@ -44,6 +44,12 @@ func TestExpandMatchedKeywords(t *testing.T) {
 			matched: []string{"drop"},
 			want:    []string{"drop"},
 		},
+		{
+			name:    "percent remains part of expanded word",
+			sql:     "select '%UPDATE%' from dual",
+			matched: []string{"update"},
+			want:    []string{"%UPDATE%"},
+		},
 	}
 
 	for _, tt := range tests {
