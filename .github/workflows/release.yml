@@ -13,6 +13,10 @@ jobs:
 
     permissions:
       contents: write
+
+    env:
+      CGO_ENABLED: '1'
+      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v2.0.0' }}
     
     strategy:
       fail-fast: false
@@ -32,11 +36,14 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22.x'
+          go-version-file: 'go.mod'
           cache: true
 
       - name: Install Dependencies
-        run: go mod tidy
+        run: go mod download
+
+      - name: Test
+        run: go test -race ./...
 
       # 1. Build and Package on Windows
       - name: Build and Package (Windows)
@@ -44,11 +51,14 @@ jobs:
         shell: pwsh
         run: |
           $env:CGO_ENABLED="1"
-          go build -ldflags="-s -w" -o ${{ matrix.asset_name }} .
+          $ReleaseVersion = $env:RELEASE_VERSION.TrimStart('v')
+          $BuildTime = [DateTime]::UtcNow.ToString('yyyy-MM-dd_HH:mm:ss')
+          go build -ldflags="-s -w -X main.Version=$ReleaseVersion -X main.BuildTime=$BuildTime" -o ${{ matrix.asset_name }} .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           
           # Append version to zip filename
           $ArchiveName = "${{ matrix.archive_base }}-${{ github.ref_name }}.zip"
-          Compress-Archive -Path ${{ matrix.asset_name }}, user_guide.md, config.yaml.example -DestinationPath $ArchiveName
+          Compress-Archive -Path ${{ matrix.asset_name }}, README.md, user_guide.md, config.yaml.example -DestinationPath $ArchiveName
 
       # 2. Build and Package on macOS (Apple Silicon M1/M2/M3) natively
       - name: Build and Package (macOS ARM64)
@@ -57,10 +67,10 @@ jobs:
           export CGO_ENABLED=1
           export GOOS=darwin
           export GOARCH=arm64
-          go build -ldflags="-s -w" -o ${{ matrix.asset_name }} .
+          go build -ldflags="-s -w -X main.Version=${RELEASE_VERSION#v} -X main.BuildTime=$(date -u '+%Y-%m-%d_%H:%M:%S')" -o ${{ matrix.asset_name }} .
           
           # Append version to tar.gz filename
-          tar -czvf ${{ matrix.archive_base }}-${{ github.ref_name }}.tar.gz ${{ matrix.asset_name }} user_guide.md config.yaml.example
+          tar -czvf ${{ matrix.archive_base }}-${{ github.ref_name }}.tar.gz ${{ matrix.asset_name }} README.md user_guide.md config.yaml.example
 
       # 3. Cross-compile and Package Intel (amd64) on macOS using built-in clang
       - name: Build and Package (macOS Intel)
@@ -69,10 +79,10 @@ jobs:
           export CGO_ENABLED=1
           export GOOS=darwin
           export GOARCH=amd64
-          go build -ldflags="-s -w" -o oracle-mcp-server-darwin-amd64 .
+          go build -ldflags="-s -w -X main.Version=${RELEASE_VERSION#v} -X main.BuildTime=$(date -u '+%Y-%m-%d_%H:%M:%S')" -o oracle-mcp-server-darwin-amd64 .
           
           # Append version to archive filename
-          tar -czvf oracle-mcp-server-darwin-amd64-${{ github.ref_name }}.tar.gz oracle-mcp-server-darwin-amd64 user_guide.md config.yaml.example
+          tar -czvf oracle-mcp-server-darwin-amd64-${{ github.ref_name }}.tar.gz oracle-mcp-server-darwin-amd64 README.md user_guide.md config.yaml.example
 
       # 4. Upload all built archives using glob patterns
       - name: Upload Release Asset

@@ -15,7 +15,7 @@ import (
 
 // Version information (set via build flags)
 var (
-	Version   = "1.0.0"
+	Version   = "2.0.0"
 	BuildTime = "unknown"
 )
 
@@ -40,6 +40,7 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	mcp.Version = Version
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {

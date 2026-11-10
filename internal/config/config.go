@@ -27,7 +27,10 @@ type Config struct {
 // Connections: name -> DSN. Names are used as the "connection" argument in execute_sql.
 // If only one connection is configured, it is used for all SQL (connection argument optional).
 type OracleConfig struct {
+	LazyMode    bool              `yaml:"lazy_mode"`
 	Connections map[string]string `yaml:"connections"`
+	// ConnectionSSH is optional, independent plaintext SSH configuration per database connection.
+	ConnectionSSH map[string]SSHConfig `yaml:"connection_ssh"`
 	// ConnectionSecurity maps connection name -> security profile name ("default" or a key of security_profiles).
 	// Connections not listed here use the default profile.
 	ConnectionSecurity map[string]string `yaml:"connection_security"`
@@ -104,12 +107,14 @@ type LoggingConfig struct {
 	AuditLog       bool   `yaml:"audit_log"`
 	VerboseLogging bool   `yaml:"verbose_logging"` // when true, log one line per execute_sql: [debug] Execute Action: <type>, Connection: <name>
 	LogFile        string `yaml:"log_file"`
+	ErrorLogFile   string `yaml:"error_log_file"` // Connectivity diagnostics, separate from SQL audit log.
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
 		Oracle: OracleConfig{
+			LazyMode:    true,
 			Connections: nil,
 		},
 		Security: defaultSecurityConfig(),
@@ -117,6 +122,7 @@ func DefaultConfig() *Config {
 			AuditLog:       true,
 			VerboseLogging: true,
 			LogFile:        "audit.log",
+			ErrorLogFile:   "error.log",
 		},
 	}
 }
@@ -148,6 +154,7 @@ func LoadFromFile(path string) (*Config, error) {
 	}
 
 	config := DefaultConfig()
+	config.ConfigPath = path
 	if err := yaml.Unmarshal(data, config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -214,6 +221,14 @@ func processConnections(connections map[string]string) (map[string]string, map[s
 func (c *Config) Validate() error {
 	if len(c.Oracle.Connections) == 0 {
 		return fmt.Errorf("oracle.connections is required and must have at least one entry")
+	}
+	for name, ssh := range c.Oracle.ConnectionSSH {
+		if _, ok := c.Oracle.Connections[name]; !ok {
+			return fmt.Errorf("oracle.connection_ssh: unknown connection %q", name)
+		}
+		if err := ssh.Validate(); err != nil {
+			return fmt.Errorf("oracle.connection_ssh.%s: %w", name, err)
+		}
 	}
 	if err := c.Security.validate("security"); err != nil {
 		return err

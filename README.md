@@ -19,6 +19,9 @@ A Model Context Protocol (MCP) server for Oracle Database, enabling AI assistant
 
 ## Features
 
+- **v2.0.0 lazy connections**: `oracle.lazy_mode: true` by default; startup and connection listing open no SSH or database connections. Every database operation checks/reconnects its selected connection before SQL is sent.
+- **Independent bastion tunnels**: One SSH login to each connection's bastion, then TCP forwarding to the Oracle listener; no database-server SSH account/key. Connectivity diagnostics go to a separate `error.log`.
+
 - **Full SQL support**: SELECT, INSERT, UPDATE, DELETE, DDL (CREATE, DROP, ALTER, etc.), and multiple statements per request
 - **Execute from file**: Run a full SQL file via `execute_sql_file`; trailing SQL*Plus `/` is stripped automatically
 - **Query to file**: `query_to_csv_file` (result as CSV, RFC 4180, UTF-8) and `query_to_text_file` (plain text, tab-separated, CLOB in full; e.g. for procedure source)
@@ -27,8 +30,8 @@ A Model Context Protocol (MCP) server for Oracle Database, enabling AI assistant
 - **Whitelist review bypass**: `Allow Header` saves the SQL first line to `whitelist.json` and skips future review for the same connection + header line
 - **Whitelist keyword filtering**: `Allow Keyword` saves a keyword to `whitelist.json` without approving the current review; future matches remove only that specific expanded keyword trigger, while other unmatched dangerous triggers still open review
 - **Whitelist keyword guardrails**: review UI only accepts whitelist keywords made of letters, numbers, and underscores, and blocks values that exactly match `danger_keywords` (case-insensitive)
-- **Danger keyword matching**: `whole_text` (substring in full SQL) or `tokens` (exact token match; e.g. `created_at` does not match `create`)
-- **Multi-database**: Configure multiple connections; use `list_connections` to see names and status (failed connections are retried on each list; only `list_connections` re-validates—other tools fast-fail on an unavailable connection until you call it again)
+- **Danger keyword matching**: `whole_text` (whole-word matching including strings/comments) or `tokens` (exact tokens after stripping strings/comments); identifiers such as `request_delete` do not match `delete`
+- **Multi-database**: Configure multiple connections; default lazy mode lists configured names without opening connections. Every database operation checks/reconnects its selected connection. Set `oracle.lazy_mode: false` for eager connections
 - **Audit logging**: Keyed fields (`AUDIT_TIME`, `AUDIT_CONNECTION`, `AUDIT_KEYWORDS`, `AUDIT_APPROVED`, `AUDIT_ACTION`, `AUDIT_SQL`) plus whitelist context such as `HEADER_LINE` and `EXPANDED_KEYWORDS`; full SQL, record separator `######AUDIT_END######`; 10MB rotation, reuse last non-full file on startup, filenames include creation date (e.g. `audit_2006-01-02_150405.log`)
 - **Connection security**: Database connection strings (including passwords) in `config.yaml` are automatically encrypted on first startup — no manual steps required
 - **Cross-platform review UI**: Windows (WinForms + WebBrowser) and macOS (JXA/Cocoa dialog) both support `Allow Keyword`, `Allow Header`, `Execute`, and `Cancel`
@@ -87,7 +90,7 @@ oracle:
     # database2: "user/pass@//host2:1521/ORCL"
 
 security:
-  # "whole_text" = substring in full SQL; "tokens" = exact token match (e.g. created_at ≠ create)
+  # "whole_text" = whole words including strings/comments; "tokens" = tokens without strings/comments
   danger_keyword_match: "whole_text"
 
   danger_keywords:
@@ -107,7 +110,7 @@ logging:
   log_file: "audit.log"  # Base name; actual files: audit_YYYY-MM-DD_HHMMSS.log, 10MB rotation
 ```
 
-With **one** connection, all SQL runs against that database (no need to pass `connection`). With **multiple** connections, use the `connection` argument in `execute_sql` / `execute_sql_file` and `list_connections` to see names and availability.
+Always pass the configured `connection` name to database tools, including when only one connection is configured. Use `list_connections` to discover names and last-known state.
 
 **Multiple security profiles:** define named profiles under `security_profiles` (same fields as `security`; omitted fields use built-in defaults) and bind connections to them with `oracle.connection_security`. Connections not listed use the top-level `security` section (profile name `default`, which can also be referenced explicitly). Unknown profile or connection names are rejected at startup.
 
@@ -126,6 +129,45 @@ security_profiles:
 ```
 
 > **Connection security:** On first startup, any plain-text connection strings in `config.yaml` are automatically replaced with encrypted values. The file is updated in place — comments and formatting are preserved.
+
+### Per-connection SSH tunnels
+
+Add an optional `oracle.connection_ssh` entry keyed by database connection name:
+
+```yaml
+oracle:
+  connections:
+    prod: 'user="app" password="db-password" connectString="db.internal:1521/ORCLPDB1"'
+    dev: 'app/password@//dev-db:1521/DEV'
+  connection_ssh:
+    prod:
+      host: jump.example.com
+      port: 22
+      username: oracle
+      private_key_file: '~/.ssh/id_ed25519'
+      remote_host: db.internal
+      remote_port: 1521
+logging:
+  error_log_file: error.log
+```
+
+Each configured connection owns its SSH session and loopback listener, even when jump hosts are identical. Connections without SSH settings remain direct. SSH settings remain **plaintext**, including optional `password` and `private_key_passphrase`; database DSNs retain their existing encryption. Choose exactly one authentication method: `private_key_file`, `password`, or `password_env`. For encrypted keys, use either `private_key_passphrase` or `private_key_passphrase_env`. Environment fields contain variable names. Relative file paths resolve from the config directory; `~/` resolves from the user's home directory.
+
+`host`, `port`, `username` and SSH authentication fields describe the **bastion only**. The program performs one SSH login to that bastion, then requests TCP forwarding to `remote_host:remote_port` (the Oracle listener). The database server needs no SSH service, operating-system account or SSH key. The application does not import `~/.ssh/config` or execute ProxyCommand programs.
+
+The SSH host must already be trusted in `known_hosts` (default `~/.ssh/known_hosts`); verify its fingerprint before adding it. The jump host must permit TCP forwarding and reach `remote_host:remote_port`. That target is resolved from the jump host. Defaults: SSH port 22, remote port 1521. Local ports are automatically allocated and kept stable during SSH reconnects. Runtime DSN changes are never saved to disk.
+
+`known_hosts_file` is optional; normally omit it to use the runtime user's `~/.ssh/known_hosts` on Windows and macOS. `host` is the bastion SSH address; `remote_host` is the database TCP address as reached from that bastion. Only the bastion needs an SSH key.
+
+`oracle.lazy_mode` defaults to **true**. Startup and `list_connections` do not connect to SSH or Oracle, and no background recovery workers are started. Every database operation checks/reconnects only its selected connection before executing SQL: verify the bastion SSH session with a round trip, then ping the database and recreate a failed connection pool when needed. New connections perform the SSH handshake and database connection test. With `lazy_mode: false`, startup connects eagerly, listing retries failures, and SSH recovery also runs in the background with backoff up to 60 seconds. Pre-operation checks apply in both modes. In-flight SQL may fail and is **never replayed**. Shutdown closes connection pools, SSH sessions, listeners and forwarding connections.
+
+Normally one tool call is sufficient even after an idle tunnel disconnects: MCP reconnects internally **before sending SQL**, then executes the requested operation. If connection setup fails, fix the reported cause and call the same operation again; no `list_connections` call is required. If SQL was already submitted when the connection broke, first check whether a write completed before manually repeating it.
+
+`list_connections` returns `lazy_mode` and includes `connection_checked`, `ssh_enabled`, `ssh_connected`, `database_connected`, `error_code`, `last_error`, and `user_action`, alongside `name` and `available`. In lazy mode every configured connection has `available: true` (configured for use, **not verified reachable**). Other fields are last-known diagnostics: an unused connection has `connection_checked: false`. Previously observed failures remain visible without causing a retry during listing. SQL tool errors also report an SSH cause when known. Error codes distinguish `SSH_CONFIG_ERROR`, `SSH_CONNECT_FAILED`, `SSH_DISCONNECTED`, `SSH_FORWARD_FAILED`, `SSH_LISTEN_FAILED`, `SSH_DSN_UNSUPPORTED`, and `DATABASE_CONNECT_FAILED`. AI clients should use `user_action` to help users check the appropriate settings.
+
+Connectivity failures go to `logging.error_log_file` (default `error.log`, relative to the config directory) and stderr, independently of audit logging. Repeated identical failures are suppressed until their state changes. SQL audit records retain attempted operations but omit SSH diagnostic details. Database passwords and DSNs are not included in connectivity diagnostics.
+
+SSH currently supports a **single TCP Easy Connect** database DSN (`host:port/service`). TNS aliases, TCPS/wallets, multi-host descriptors and RAC/SCAN redirection are not supported. The Oracle Instant Client requirement remains unchanged.
 
 ### Environment Variables
 
@@ -209,11 +251,11 @@ Replace `/path/to/oracle-mcp` and `/opt/oracle/instantclient_19_20` with your ac
 
 | Tool | Description |
 |------|-------------|
-| **execute_sql** | Run SQL (one or multiple statements). Params: `sql`, optional `connection`. Do not specify schema-qualified object names such as `hr.employees`; the server rejects them. |
-| **execute_sql_file** | Read SQL from a file, analyze, show review if needed, then execute. Trailing `/` is stripped. Params: `file_path`, optional `connection`. SQL in the file must not specify schema-qualified object names such as `hr.employees`. |
-| **list_connections** | List configured connection names and availability; retries previously failed connections (only this tool re-validates—others fast-fail on unavailable connection until you call list_connections again). |
-| **query_to_csv_file** | Run a query and write the result to a file as CSV (header + rows, UTF-8, RFC 4180). Params: `sql`, `file_path` (absolute), optional `connection`. Same review as `execute_sql` when SQL matches danger keywords or DDL (if enabled). Do not specify schema-qualified object names such as `hr.employees`. |
-| **query_to_text_file** | Run a query and write the result to a file as plain text (tab-separated, no header; CLOB in full; e.g. for procedure source). Params: `sql`, `file_path` (absolute), optional `connection`. Same review as `execute_sql` when SQL matches danger keywords or DDL (if enabled). Do not specify schema-qualified object names such as `hr.employees`. |
+| **execute_sql** | Run SQL (one or multiple statements). Params: `sql`, required `connection`. Do not specify schema-qualified object names such as `hr.employees`; the server rejects them. |
+| **execute_sql_file** | Read SQL from a file, analyze, show review if needed, then execute. Trailing `/` is stripped. Params: `file_path`, required `connection`. SQL in the file must not specify schema-qualified object names such as `hr.employees`. |
+| **list_connections** | Default lazy mode lists configured connections without network I/O; `available: true` means configured. Every database operation checks/reconnects its selected connection. Eager mode also retries failed connections during listing. |
+| **query_to_csv_file** | Run a query and write the result to a file as CSV (header + rows, UTF-8, RFC 4180). Params: `sql`, `file_path` (absolute), required `connection`. Same review as `execute_sql` when SQL matches danger keywords or DDL (if enabled). Do not specify schema-qualified object names such as `hr.employees`. |
+| **query_to_text_file** | Run a query and write the result to a file as plain text (tab-separated, no header; CLOB in full; e.g. for procedure source). Params: `sql`, `file_path` (absolute), required `connection`. Same review as `execute_sql` when SQL matches danger keywords or DDL (if enabled). Do not specify schema-qualified object names such as `hr.employees`. |
 
 ### Example Interactions
 
@@ -266,7 +308,7 @@ Execution proceeds only after the user confirms. Rejection is logged and returne
 
 ### Tool: `execute_sql`
 
-**Input**: `sql` (required), `connection` (optional). Do not specify schema-qualified object names such as `hr.employees`; the server rejects them.
+**Input**: `sql` (required), `connection` (required). Do not specify schema-qualified object names such as `hr.employees`; the server rejects them.
 
 **Output (query)**: `columns`, `rows`, `statement_type`, `execution_time_ms`, `success`.
 
@@ -276,19 +318,19 @@ Execution proceeds only after the user confirms. Rejection is logged and returne
 
 ### Tool: `execute_sql_file`
 
-**Input**: `file_path` (required), `connection` (optional). Same analysis and review rules as `execute_sql`; executes the file contents (trailing `/` stripped).
+**Input**: `file_path` (required), `connection` (required). Same analysis and review rules as `execute_sql`; executes the file contents (trailing `/` stripped).
 
 ### Tool: `list_connections`
 
-**Input**: none. **Output**: `connections` (name + availability), `message`. Only this tool re-validates failed connections; other tools return an error if the chosen connection is currently unavailable until you call list_connections again.
+**Input**: none. **Output**: `lazy_mode`, `connections`, `message`. Each connection includes `name`, `available`, `connection_checked`, `ssh_enabled`, `ssh_connected`, `database_connected`, and optional `error_code`, `last_error`, `user_action`. Default lazy mode performs no network checks and returns all configured connections with `available: true`; diagnostics describe the last observed state. Database operations check/reconnect their selected connection before executing SQL.
 
 ### Tool: `query_to_csv_file`
 
-**Input**: `sql` (required), `file_path` (required, absolute path), `connection` (optional). **Output**: success and path. Same confirmation rules as `execute_sql` when SQL matches `danger_keywords` or is DDL (if `require_confirm_for_ddl`). Writes CSV with header, UTF-8, RFC 4180; CLOB columns read in full.
+**Input**: `sql` (required), `file_path` (required, absolute path), `connection` (required). **Output**: success and path. Same confirmation rules as `execute_sql` when SQL matches `danger_keywords` or is DDL (if `require_confirm_for_ddl`). Writes CSV with header, UTF-8, RFC 4180; CLOB columns read in full.
 
 ### Tool: `query_to_text_file`
 
-**Input**: `sql` (required), `file_path` (required, absolute path), `connection` (optional). **Output**: success and path. Same confirmation rules as `execute_sql` when SQL matches `danger_keywords` or is DDL (if `require_confirm_for_ddl`). Writes plain text, tab-separated columns, no header; CLOB in full (e.g. for procedure source).
+**Input**: `sql` (required), `file_path` (required, absolute path), `connection` (required). **Output**: success and path. Same confirmation rules as `execute_sql` when SQL matches `danger_keywords` or is DDL (if `require_confirm_for_ddl`). Writes plain text, tab-separated columns, no header; CLOB in full (e.g. for procedure source).
 
 ## Troubleshooting
 
@@ -317,7 +359,7 @@ If you prefer to build the binary yourself (e.g. for a different Go version or p
 
 ### Build dependencies
 
-- Go 1.22+
+- Go 1.26+
 - **CGO must be enabled**: godror requires CGO and a C compiler.
 - **Windows**: Use **MinGW-w64** (GCC 7.2+) and add its `bin` to PATH.
   - **Do not use Cygwin's gcc.** If both are installed, ensure MinGW's `bin` comes before Cygwin in PATH, or you may see `cannot parse gcc output ... as ELF, Mach-O, PE, XCOFF`.
@@ -421,8 +463,9 @@ B站视频介绍: [Cursor连接Oracle自动编写存储过程](https://www.bilib
 - **Header 白名单**：`Allow Header` 会把 SQL 第一行写入 `whitelist.json`，下次同一连接且第一行相同的 SQL 直接跳过 review
 - **Keyword 白名单**：`Allow Keyword` 只把关键字写入 `whitelist.json`，不会自动批准当前 review；后续只会消掉该 expanded keyword 对应的触发项，其他未放行触发项仍会继续弹出 review
 - **Keyword 白名单限制**：只能添加字母、数字、下划线组成的关键字；如果与 `danger_keywords` 中某项完全相同（忽略大小写）则禁止添加
-- **危险词匹配**：`whole_text`（整段 SQL 子串）或 `tokens`（精确词匹配，如 `created_at` 不匹配 `create`）
-- **多数据库**：可配置多个连接；用 `list_connections` 查看名称与状态（失败连接每次列出时会重试；仅 `list_connections` 会重新校验—其他工具在连接不可用时直接报错，需再次调用 list_connections 后重试）
+- **危险词匹配**：`whole_text` 按完整词匹配（包括字符串和注释）；`tokens` 去掉字符串和注释后按 token 匹配。`request_delete` 等标识符不会因包含 `delete` 而命中。
+- **v2.0.0 延迟连接**：`oracle.lazy_mode` 默认开启，启动及列出连接不建立隧道或数据库连接；每次数据库操作前仅检查并恢复所选连接。
+- **独立 bastion 隧道**：每个连接独立配置 bastion，通过其转发数据库 TCP 端口；无需数据库服务器 SSH 账号或密钥，连接错误写入独立 `error.log`。
 - **审计日志**：键值字段（`AUDIT_TIME`、`AUDIT_CONNECTION`、`AUDIT_KEYWORDS`、`AUDIT_APPROVED`、`AUDIT_ACTION`、`AUDIT_SQL`），并可附带 `HEADER_LINE`、`EXPANDED_KEYWORDS`；完整 SQL、记录分隔符 `######AUDIT_END######`；单文件 10MB 轮转，启动时复用最近未满的日志，文件名含创建日期（如 `audit_2006-01-02_150405.log`）
 - **连接安全**：`config.yaml` 中的数据库连接串（含密码）在首次启动时自动加密，无需任何手动操作
 - **跨平台确认窗口**：Windows（WinForms + WebBrowser）与 macOS（JXA/Cocoa）都支持 `Allow Keyword`、`Allow Header`、`Execute`、`Cancel`
@@ -501,9 +544,36 @@ logging:
   log_file: "audit.log"
 ```
 
-**单连接**时所有 SQL 都发往该库（无需传 `connection`）。**多连接**时在 `execute_sql` / `execute_sql_file` 中通过 `connection` 指定，并用 `list_connections` 查看名称与可用性。
+数据库工具每次都需要传入已配置的 `connection` 名称，单连接也一样。用 `list_connections` 查看名称和最近状态。
 
 > **连接安全：** 首次启动时，`config.yaml` 中的明文连接串会被自动替换为加密值，文件原地更新，注释与格式完整保留。
+
+### v2.0.0：延迟连接与 SSH 隧道
+
+```yaml
+oracle:
+  lazy_mode: true
+  connections:
+    prod: 'app/db-password@//db.internal:1521/SERVICE'
+    direct: 'app/db-password@//direct-db:1521/SERVICE'
+  connection_ssh:
+    prod:
+      host: bastion.example.com
+      username: opc
+      private_key_file: '~/.ssh/id_rsa'
+      remote_host: db.internal
+      remote_port: 1521
+logging:
+  error_log_file: error.log
+```
+
+`host` 是 bastion 的 SSH 地址；`remote_host` 是 bastion 可访问的数据库地址。程序仅登录 bastion，并转发数据库 TCP 端口，不登录数据库服务器。每个连接独立配置，没有 `connection_ssh` 条目的连接继续直连。
+
+`known_hosts_file` 可以省略，默认使用运行用户的 `~/.ssh/known_hosts`（Windows/macOS 通用）。SSH 端口默认 22，数据库目标端口默认 1521。本地端口自动分配。SSH 配置保持明文，数据库 DSN 保留原有加密规则。`password` 可替代私钥；完整认证选项见配置模板。
+
+`lazy_mode: true` 时，启动和 `list_connections` 不联网，所有配置连接返回 `available: true`，表示已配置，不代表已经验证可达。查看 `connection_checked` 和 SSH/数据库状态字段可区分尚未尝试与曾经失败。每次数据库操作前程序先检查、必要时自动重连 SSH 和数据库，再发送 SQL；通常一次调用即可。连接准备失败时可以重试同一个操作，无需先调用 `list_connections`。SQL 已发送后断线不会自动重放；手动重跑写操作前应先确认结果。
+
+关闭 lazy 模式会恢复启动连接、列出连接时重试及 SSH 后台维护；操作前检查在两种模式下都执行。SSH 目前只支持单目标 TCP Easy Connect，TNS 别名、TCPS/wallet、RAC/SCAN 重定向不支持通过此隧道使用。错误诊断写到独立 `error.log`，与 audit log 分离。
 
 ### 环境变量
 
@@ -585,11 +655,11 @@ ADB 使用 **TCPS (SSL)**，需要 **Wallet**。连接串使用钱包中 `tnsnam
 
 | 工具 | 说明 |
 |------|------|
-| **execute_sql** | 执行 SQL（单条或多条）。参数：`sql`，可选 `connection`。 |
-| **execute_sql_file** | 从文件读取 SQL，分析、必要时展示确认，再执行。末尾 `/` 会被去除。参数：`file_path`，可选 `connection`。 |
-| **list_connections** | 列出已配置连接名称及可用性；会对之前失败的连接重试（仅此工具会重新校验—其他工具在连接不可用时直接报错，需再次调用 list_connections 后重试）。 |
-| **query_to_csv_file** | 执行查询并将结果写入文件为 CSV（表头+行，UTF-8，RFC 4180）。参数：`sql`、`file_path`（绝对路径），可选 `connection`。与 `execute_sql` 相同：命中危险词或 DDL（若开启）时弹出审查。 |
-| **query_to_text_file** | 执行查询并将结果写入文件为纯文本（制表符分隔、无表头；CLOB 完整输出，如存过程源码）。参数：`sql`、`file_path`（绝对路径），可选 `connection`。与 `execute_sql` 相同：命中危险词或 DDL（若开启）时弹出审查。 |
+| **execute_sql** | 执行 SQL（单条或多条）。参数：`sql`，必填 `connection`。 |
+| **execute_sql_file** | 从文件读取 SQL，分析、必要时展示确认，再执行。末尾 `/` 会被去除。参数：`file_path`，必填 `connection`。 |
+| **list_connections** | 默认 lazy 模式只列配置，不建立或检查连接；所有已配置连接返回 `available: true`。数据库操作前自动检查并恢复所选连接；关闭 lazy 模式时列表也会重试失败项。 |
+| **query_to_csv_file** | 执行查询并将结果写入文件为 CSV（表头+行，UTF-8，RFC 4180）。参数：`sql`、`file_path`（绝对路径），必填 `connection`。与 `execute_sql` 相同：命中危险词或 DDL（若开启）时弹出审查。 |
+| **query_to_text_file** | 执行查询并将结果写入文件为纯文本（制表符分隔、无表头；CLOB 完整输出，如存过程源码）。参数：`sql`、`file_path`（绝对路径），必填 `connection`。与 `execute_sql` 相同：命中危险词或 DDL（若开启）时弹出审查。 |
 
 ### 使用示例
 
@@ -642,7 +712,7 @@ query_to_text_file({ "sql": "SELECT text FROM user_source WHERE name='MY_PROC'",
 
 ### 工具：`execute_sql`
 
-**输入**：`sql`（必填），`connection`（可选）。
+**输入**：`sql`（必填），`connection`（必填）。
 
 **输出（查询）**：`columns`、`rows`、`statement_type`、`execution_time_ms`、`success`。
 
@@ -652,19 +722,19 @@ query_to_text_file({ "sql": "SELECT text FROM user_source WHERE name='MY_PROC'",
 
 ### 工具：`execute_sql_file`
 
-**输入**：`file_path`（必填），`connection`（可选）。与 `execute_sql` 相同的分析与确认规则；执行文件内容（末尾 `/` 去除）。
+**输入**：`file_path`（必填），`connection`（必填）。与 `execute_sql` 相同的分析与确认规则；执行文件内容（末尾 `/` 去除）。
 
 ### 工具：`list_connections`
 
-**输入**：无。**输出**：`connections`（名称 + 可用性），`message`。仅此工具会重新校验失败连接；其他工具在所选连接不可用时直接报错，需再次调用 list_connections 后重试。
+**输入**：无。**输出**：`lazy_mode`、`connections`、`message`。连接包含 `name`、`available`、`connection_checked`、`ssh_enabled`、`ssh_connected`、`database_connected`，以及可选的 `error_code`、`last_error`、`user_action`。默认 lazy 模式不联网；`available: true` 表示已配置，其余字段反映最近状态。每次数据库操作前检查并恢复所选连接。
 
 ### 工具：`query_to_csv_file`
 
-**输入**：`sql`（必填）、`file_path`（必填，绝对路径）、`connection`（可选）。**输出**：成功及路径。与 `execute_sql` 相同：命中 `danger_keywords` 或为 DDL（若 `require_confirm_for_ddl`）时弹出确认。写入带表头的 CSV，UTF-8，RFC 4180；CLOB 列完整读取。
+**输入**：`sql`（必填）、`file_path`（必填，绝对路径）、`connection`（必填）。**输出**：成功及路径。与 `execute_sql` 相同：命中 `danger_keywords` 或为 DDL（若 `require_confirm_for_ddl`）时弹出确认。写入带表头的 CSV，UTF-8，RFC 4180；CLOB 列完整读取。
 
 ### 工具：`query_to_text_file`
 
-**输入**：`sql`（必填）、`file_path`（必填，绝对路径）、`connection`（可选）。**输出**：成功及路径。与 `execute_sql` 相同：命中 `danger_keywords` 或为 DDL（若 `require_confirm_for_ddl`）时弹出确认。写入纯文本，列以制表符分隔、无表头；CLOB 完整输出（如存过程源码）。
+**输入**：`sql`（必填）、`file_path`（必填，绝对路径）、`connection`（必填）。**输出**：成功及路径。与 `execute_sql` 相同：命中 `danger_keywords` 或为 DDL（若 `require_confirm_for_ddl`）时弹出确认。写入纯文本，列以制表符分隔、无表头；CLOB 完整输出（如存过程源码）。
 
 ## 故障排除
 
@@ -693,7 +763,7 @@ Error: ORA-01031: insufficient privileges
 
 ### 构建依赖
 
-- Go 1.22+
+- Go 1.26+
 - **须启用 CGO**：godror 依赖 CGO 和 C 编译器。
 - **Windows**：使用 **MinGW-w64**（GCC 7.2+）并将其 `bin` 加入 PATH。
   - **不要用 Cygwin 的 gcc。** 若两者都有，确保 PATH 中 MinGW 的 `bin` 在 Cygwin 之前，否则可能出现 `cannot parse gcc output ... as ELF, Mach-O, PE, XCOFF`。

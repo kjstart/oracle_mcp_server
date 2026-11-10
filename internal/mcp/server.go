@@ -5,8 +5,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +26,9 @@ import (
 var ServerBuildTag = "U2VydEuMA=="
 var McpSchemaRev = "TWNwU2N"
 var ProtocolBuild = "xWMg=="
+
+// Version is set from the executable's release metadata before serving requests.
+var Version = "2.0.0"
 
 // JSON-RPC 2.0 structures
 type jsonRPCRequest struct {
@@ -130,6 +135,8 @@ const (
 
 // Server is the MCP server implementation.
 type Server struct {
+	errorLogFile *os.File
+	closeOnce    sync.Once
 	config       *config.Config
 	executorPool *oracle.ExecutorPool
 	analyzers    map[string]*sqlanalyzer.Analyzer // connection name -> analyzer built from that connection's security profile
@@ -158,7 +165,35 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("no Oracle connections in config")
 	}
 
-	executorPool, err := oracle.NewExecutorPool(connections)
+	errorPath := cfg.Logging.ErrorLogFile
+	if errorPath == "" {
+		errorPath = "error.log"
+	}
+	if cfg.ConfigPath != "" && !filepath.IsAbs(errorPath) {
+		errorPath = filepath.Join(filepath.Dir(cfg.ConfigPath), errorPath)
+	}
+	if cfg.Logging.AuditLog {
+		auditPath := cfg.Logging.LogFile
+		if cfg.ConfigPath != "" && !filepath.IsAbs(auditPath) {
+			auditPath = filepath.Join(filepath.Dir(cfg.ConfigPath), auditPath)
+		}
+		errorAbs, _ := filepath.Abs(errorPath)
+		auditAbs, _ := filepath.Abs(auditPath)
+		if strings.EqualFold(errorAbs, auditAbs) {
+			return nil, fmt.Errorf("logging.error_log_file must differ from logging.log_file")
+		}
+	}
+	errorFile, err := os.OpenFile(errorPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open error log: %w", err)
+	}
+	ready := false
+	defer func() {
+		if !ready {
+			errorFile.Close()
+		}
+	}()
+	executorPool, err := oracle.NewExecutorPool(connections, oracle.PoolOptions{SSH: cfg.SSHConnections(), ErrorLog: log.New(errorFile, "", log.LstdFlags|log.LUTC), Eager: !cfg.Oracle.LazyMode})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Oracle executor pool: %w", err)
 	}
@@ -191,7 +226,9 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		analyzers[name] = sqlanalyzer.NewAnalyzer(sec.DangerKeywords, sec.DangerKeywordMatch)
 	}
 
+	ready = true
 	return &Server{
+		errorLogFile: errorFile,
 		config:       cfg,
 		executorPool: executorPool,
 		analyzers:    analyzers,
@@ -216,18 +253,40 @@ type reviewDecision struct {
 // Run starts the MCP server and processes requests.
 func (s *Server) Run(ctx context.Context) error {
 	defer s.Close()
-
+	// Reading stdin must not prevent cancellation from closing SSH sessions.
+	type input struct {
+		line []byte
+		err  error
+	}
+	inputs := make(chan input)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			line, err := s.reader.ReadBytes('\n')
+			select {
+			case inputs <- input{line, err}:
+			case <-stop:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			if err := s.processRequest(); err != nil {
-				if err == io.EOF {
-					return nil
-				}
-				// Log error but continue processing
-				fmt.Fprintf(os.Stderr, "Error processing request: %v\n", err)
+		case in := <-inputs:
+			if len(in.line) > 0 {
+				s.processLine(in.line)
+			}
+			if in.err == io.EOF {
+				return nil
+			}
+			if in.err != nil {
+				return in.err
 			}
 		}
 	}
@@ -235,12 +294,17 @@ func (s *Server) Run(ctx context.Context) error {
 
 // Close cleans up server resources.
 func (s *Server) Close() {
-	if s.executorPool != nil {
-		s.executorPool.Close()
-	}
-	if s.auditor != nil {
-		s.auditor.Close()
-	}
+	s.closeOnce.Do(func() {
+		if s.executorPool != nil {
+			s.executorPool.Close()
+		}
+		if s.auditor != nil {
+			s.auditor.Close()
+		}
+		if s.errorLogFile != nil {
+			s.errorLogFile.Close()
+		}
+	})
 }
 
 // processRequest reads and handles a single JSON-RPC request.
@@ -250,14 +314,18 @@ func (s *Server) processRequest() error {
 		return err
 	}
 
+	s.processLine(line)
+	return nil
+}
+
+func (s *Server) processLine(line []byte) {
 	var req jsonRPCRequest
 	if err := json.Unmarshal(line, &req); err != nil {
 		s.sendError(nil, ErrCodeParseError, "Parse error", nil)
-		return nil
+		return
 	}
 
 	s.handleRequest(&req)
-	return nil
 }
 
 // handleRequest routes the request to the appropriate handler.
@@ -295,7 +363,7 @@ func (s *Server) handleInitialize(req *jsonRPCRequest) {
 		},
 		ServerInfo: serverInfo{
 			Name:    "oracle-mcp-server",
-			Version: "1.0.0",
+			Version: Version,
 		},
 	}
 
@@ -344,7 +412,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			},
 			{
 				Name:        "list_connections",
-				Description: "List the names of configured Oracle database connections. Use these names as the 'connection' argument in execute_sql when copying or syncing between databases.",
+				Description: "List configured Oracle connections and last-known diagnostics. Default lazy_mode: listing does not open or probe SSH/database connections; available=true means configured, not verified reachable. Inspect connection_checked, ssh_enabled, ssh_connected, database_connected, error_code, last_error and user_action. Each database operation checks its selected connection and reconnects before execution. On SSH errors, ask the user to check the jump host/settings. With lazy_mode=false, listing also retries failed connections.",
 				InputSchema: inputSchema{
 					Type:       "object",
 					Properties: map[string]property{},
@@ -642,7 +710,7 @@ func (s *Server) handleExecuteSQL(req *jsonRPCRequest, args map[string]interface
 	if err != nil {
 		// Approved=true: execution was attempted after passing confirmation (or confirmation was not required).
 		// Do not use false here — that would imply USER_REJECTED while ORA-* proves the server ran the statement.
-		s.logAudit(sql, review.auditKeywords, review.approval, "EXECUTION_ERROR: "+err.Error(), displayConnection, reviewHeaderLineOption(review))
+		s.logAudit(sql, review.auditKeywords, review.approval, "EXECUTION_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))
 		s.sendToolError(req.ID, fmt.Sprintf("SQL execution failed: %v", err))
 		return
 	}
@@ -724,7 +792,7 @@ func (s *Server) handleExecuteSQLFile(req *jsonRPCRequest, args map[string]inter
 	ctx := context.Background()
 	result, err := s.executorPool.Execute(ctx, connectionName, sql, review.stmtType)
 	if err != nil {
-		s.logAudit(sql, review.auditKeywords, review.approval, "EXECUTION_ERROR: "+err.Error(), displayConnection, reviewHeaderLineOption(review))
+		s.logAudit(sql, review.auditKeywords, review.approval, "EXECUTION_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))
 		s.sendToolError(req.ID, fmt.Sprintf("SQL execution failed: %v", err))
 		return
 	}
@@ -754,11 +822,19 @@ func (s *Server) handleExecuteSQLFile(req *jsonRPCRequest, args map[string]inter
 func (s *Server) handleListConnections(req *jsonRPCRequest) {
 	statuses := s.executorPool.ListConnectionsWithStatus()
 	out := map[string]interface{}{
+		"lazy_mode":   s.config.Oracle.LazyMode,
 		"connections": statuses,
-		"message":     "Use these names as the 'connection' argument in execute_sql. Disabled connections are currently unreachable; they will be retried on each list_connections call.",
+		"message":     connectionListingMessage(s.config.Oracle.LazyMode),
 	}
 	resultJSON, _ := json.MarshalIndent(out, "", "  ")
 	s.sendToolResult(req.ID, string(resultJSON))
+}
+
+func connectionListingMessage(lazy bool) string {
+	if lazy {
+		return "Lazy mode: all configured connections are available for use, but availability is not a reachability check. Listing opens no SSH/database connections. Inspect connection_checked and last-known diagnostics. Each database operation checks/reconnects only its selected connection before SQL is executed; SQL is never replayed. SSH failures include user_action and are logged in the connectivity error log."
+	}
+	return "Eager mode: startup connects to configured databases, SSH connections recover in the background, and this listing retries failed connections. Each database operation also checks/reconnects its selected connection. Inspect last-known diagnostics and user_action."
 }
 
 // handleQueryToCSVFile handles the query_to_csv_file tool. Same danger/DDL review as execute_sql; file_path must be absolute.
@@ -815,7 +891,7 @@ func (s *Server) handleQueryToCSVFile(req *jsonRPCRequest, args map[string]inter
 	ctx := context.Background()
 	rowsWritten, err := s.executorPool.ExecuteToCSVFile(ctx, connectionName, sqlStr, filePath)
 	if err != nil {
-		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_CSV_ERROR: "+err.Error(), displayConnection, reviewHeaderLineOption(review))
+		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_CSV_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))
 		s.sendToolError(req.ID, "query_to_csv_file failed: "+err.Error())
 		return
 	}
@@ -884,7 +960,7 @@ func (s *Server) handleQueryToTextFile(req *jsonRPCRequest, args map[string]inte
 	ctx := context.Background()
 	rowsWritten, err := s.executorPool.ExecuteToTextFile(ctx, connectionName, sqlStr, filePath)
 	if err != nil {
-		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_TEXT_ERROR: "+err.Error(), displayConnection, reviewHeaderLineOption(review))
+		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_TEXT_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))
 		s.sendToolError(req.ID, "query_to_text_file failed: "+err.Error())
 		return
 	}
@@ -1013,6 +1089,14 @@ func firstSQLLine(sql string) string {
 		return sql[:idx]
 	}
 	return sql
+}
+
+func auditExecutionError(err error) string {
+	var connectivity *oracle.ConnectivityError
+	if errors.As(err, &connectivity) {
+		return "database connection unavailable; see connectivity error log"
+	}
+	return err.Error()
 }
 
 func reviewHeaderLineOption(review *reviewDecision) *audit.LogOptions {

@@ -16,10 +16,10 @@ import (
 	"github.com/alvin/oracle-mcp-server/internal/sqlanalyzer"
 )
 
-var ExecSchemaRev  = "RXhlY3V"
-var QueryBuildTag  = "sZA=="
+var ExecSchemaRev = "RXhlY3V"
+var QueryBuildTag = "sZA=="
 var ResultRevision = "UmVzjIuMA=="
-var FetchBuildID   = "RmV0Y2hCdW"
+var FetchBuildID = "RmV0Y2hCdW"
 
 // ExecutionResult contains the result of SQL execution.
 type ExecutionResult struct {
@@ -45,6 +45,10 @@ type Executor struct {
 
 // NewExecutor creates a new Oracle executor with the given DSN.
 func NewExecutor(dsn string) (*Executor, error) {
+	return newExecutorContext(context.Background(), dsn)
+}
+
+func newExecutorContext(parent context.Context, dsn string) (*Executor, error) {
 	db, err := sql.Open("godror", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
@@ -56,7 +60,7 @@ func NewExecutor(dsn string) (*Executor, error) {
 	db.SetConnMaxLifetime(time.Hour)
 
 	// Test the connection
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {

@@ -1,11 +1,14 @@
-# Oracle MCP Server Configuration
+# Oracle MCP Server v2.0.0 Configuration
 # Copy this file to config.yaml and modify as needed
 # Author: Alvin Liu — https://alvinliu.com
 # Github: https://github.com/kjstart/cursor_oracle_mcp_server
 
-# Oracle Database Connection (required). Name -> DSN. With one entry, all SQL uses that DB.
-# With multiple entries, pass "connection" in execute_sql (see list_connections).
+# Oracle Database Connection (required). Name -> DSN.
+# Pass "connection" in every database tool call (see list_connections).
 oracle:
+  # Default true: startup/list_connections never connect; check/reconnect the selected connection on each operation.
+  # false: connect at startup, retry failures on listing and maintain SSH connections in the background.
+  lazy_mode: true
   connections:
     database1: "user/pass@//host:1521/ORCL"
 #    database2: "user/pass@//host2:1521/ORCL"
@@ -13,12 +16,29 @@ oracle:
   # Connections not listed here use the top-level "security" section.
 #  connection_security:
 #    database2: strict
+  # Optional: independent SSH tunnel for each connection; omitted connections connect directly.
+  # SSH settings (including passwords/passphrases) remain plaintext; only connections DSNs are encrypted.
+  # Local ports are allocated automatically. Relative paths resolve from this config directory.
+#  connection_ssh:
+#    database1:
+#      host: bastion.example.com         # SSH endpoint: bastion, NOT the database server
+#      port: 22                         # default 22
+#      username: oracle
+#      private_key_file: '~/.ssh/id_ed25519'
+#      # private_key_passphrase: 'plain-passphrase'
+#      # private_key_passphrase_env: SSH_KEY_PASSPHRASE  # alternative to plaintext
+#      # password: 'plain-ssh-password'                # alternative to private_key_file
+#      # password_env: SSH_PASSWORD                    # alternative to key/plain password
+#      # known_hosts_file: /custom/known_hosts # optional override; defaults to ~/.ssh/known_hosts
+#      remote_host: db.internal         # database TCP target, resolved/accessed FROM bastion
+#      remote_port: 1521                # default 1521
 # Connection string format: user/password@//host:port/service_name
 
 # Security Settings
 security:
   # How to match danger_keywords: "whole_text" (default) or "tokens"
-  # whole_text: case-insensitive substring in full SQL (e.g. column "created_at" matches "create")
+  # whole_text: case-insensitive whole-word matching, including strings/comments;
+  # identifiers such as request_delete and created_at do not match delete/create.
   # tokens: exact token match after stripping strings/comments (e.g. "created_at" does not match "create")
   danger_keyword_match: "whole_text"
 
@@ -57,5 +77,7 @@ logging:
   # When true, log one line per execute_sql: [debug] Execute Action: <type>, Connection: <name> (Cursor adds timestamp)
   verbose_logging: true
 
-  # Path to audit log file (relative to executable or absolute path)
+  # Path to audit log file (relative to config directory or absolute path)
   log_file: "audit.log"
+  # SSH/connectivity errors only; separate from SQL audit log. Relative to config directory.
+  error_log_file: "error.log"
