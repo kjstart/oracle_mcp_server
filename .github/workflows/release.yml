@@ -16,7 +16,7 @@ jobs:
 
     env:
       CGO_ENABLED: '1'
-      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v2.0.0' }}
+      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v2.0.2' }}
     
     strategy:
       fail-fast: false

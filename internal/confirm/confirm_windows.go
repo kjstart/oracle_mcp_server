@@ -4,7 +4,6 @@
 package confirm
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -15,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 	"unicode"
 	"unsafe"
 )
@@ -47,6 +45,7 @@ const (
 
 // ConfirmRequest contains the data for a confirmation dialog.
 type ConfirmRequest struct {
+	LogStage        func(stage, detail string)
 	SQL             string
 	MatchedKeywords []string
 	DisplayKeywords []string
@@ -82,25 +81,29 @@ func NewConfirmer() *Confirmer {
 // Confirm shows a confirmation dialog with full SQL in a large scrollable window and returns the approval result.
 // Uses PowerShell WinForms (never MessageBox) so SQL is never truncated and scrollbars are shown.
 func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
-	sqlDir := os.TempDir()
+	sqlDir, err := newDialogDir()
+	if err != nil {
+		return ConfirmResult{}, fmt.Errorf("confirm: create private temporary directory: %w", err)
+	}
+	defer os.RemoveAll(sqlDir)
+	req.trace("CONFIRM_TEMP_READY", fmt.Sprintf("directory=%q", sqlDir))
 	htmlPath := filepath.Join(sqlDir, "oracle-mcp-confirm-sql.html")
 	resultPath := filepath.Join(sqlDir, "oracle-mcp-confirm-result.txt")
 	scriptPath := filepath.Join(sqlDir, "oracle-mcp-confirm-dialog.ps1")
 	headerPath := filepath.Join(sqlDir, "oracle-mcp-confirm-header.txt")
 	dangerKeywordsPath := filepath.Join(sqlDir, "oracle-mcp-confirm-danger-keywords.json")
+	sqlPath := filepath.Join(sqlDir, "sql.txt")
+	signalPath := filepath.Join(sqlDir, "ui-stages.log")
 
-	htmlContent := sqlHighlightHTML(req.SQL)
-	htmlContent = highlightMatchedKeywordsInHTML(htmlContent, highlightTermsForReview(req))
-	if err := os.WriteFile(htmlPath, []byte(htmlContent), 0600); err != nil {
-		return ConfirmResult{}, fmt.Errorf("confirm: cannot write HTML temp file: %w", err)
+	mode, err := writeReviewContent(req, htmlPath, sqlPath)
+	if err != nil {
+		return ConfirmResult{}, err
 	}
-	defer os.Remove(htmlPath)
-	defer os.Remove(resultPath)
+	req.trace("CONFIRM_CONTENT_PREPARED", fmt.Sprintf("mode=%s sql_bytes=%d sql_lines=%d", mode, len(req.SQL), strings.Count(req.SQL, "\n")+1))
 
 	if err := os.WriteFile(headerPath, []byte(buildConfirmHeader(req)), 0600); err != nil {
 		return ConfirmResult{}, fmt.Errorf("confirm: cannot write header temp file: %w", err)
 	}
-	defer os.Remove(headerPath)
 
 	dangerKeywordsJSON := []byte("[]")
 	if len(req.DangerKeywords) > 0 {
@@ -113,12 +116,10 @@ func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
 	if err := os.WriteFile(dangerKeywordsPath, dangerKeywordsJSON, 0600); err != nil {
 		return ConfirmResult{}, fmt.Errorf("confirm: cannot write danger keywords temp file: %w", err)
 	}
-	defer os.Remove(dangerKeywordsPath)
 
 	if err := os.WriteFile(scriptPath, []byte(ps1Script), 0600); err != nil {
 		return ConfirmResult{}, fmt.Errorf("confirm: cannot write script temp file: %w", err)
 	}
-	defer os.Remove(scriptPath)
 
 	connectionArg := req.Connection
 	if connectionArg == "" {
@@ -129,43 +130,26 @@ func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
 
 	// -STA required for Windows Forms to display correctly
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
-		"-HtmlPath", htmlPath, "-ResultPath", resultPath, "-HeaderPath", headerPath, "-DangerKeywordsPath", dangerKeywordsPath, "-WhitelistPath", req.WhitelistPath, "-WhitelistConnection", req.WhitelistConnection, "-Connection", connectionArg, "-HeaderColor", headerColor)
-	cmd.Stdin = nil
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if stderr.Len() > 0 {
-			fmt.Fprintf(os.Stderr, "oracle-mcp confirm PowerShell stderr: %s\n", stderr.String())
-		}
-		return ConfirmResult{}, nil
+		"-HtmlPath", htmlPath, "-SqlPath", sqlPath, "-RenderMode", mode, "-SignalPath", signalPath, "-ResultPath", resultPath, "-HeaderPath", headerPath, "-DangerKeywordsPath", dangerKeywordsPath, "-WhitelistPath", req.WhitelistPath, "-WhitelistConnection", req.WhitelistConnection, "-Connection", connectionArg, "-HeaderColor", headerColor)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	if _, err := runDialog(req, cmd, signalPath); err != nil {
+		return ConfirmResult{}, err
 	}
+	return readDialogResult(resultPath)
+}
 
-	// PowerShell may exit just before the file is fully flushed; retry read briefly
-	var data []byte
-	var readErr error
-	for attempt := 0; attempt < 20; attempt++ {
-		data, readErr = os.ReadFile(resultPath)
-		if readErr == nil && len(data) > 0 {
-			break
-		}
-		if attempt < 19 {
-			time.Sleep(50 * time.Millisecond)
-		}
+func writeReviewContent(req *ConfirmRequest, htmlPath, sqlPath string) (string, error) {
+	if err := os.WriteFile(sqlPath, []byte(req.SQL), 0600); err != nil {
+		return "", fmt.Errorf("confirm: write SQL content: %w", err)
 	}
-	if len(data) == 0 {
-		return ConfirmResult{}, nil
+	if len(req.SQL) > 64*1024 || strings.Count(req.SQL, "\n") >= 1000 {
+		return "plain", nil
 	}
-	// PowerShell/.NET WriteAllText(..., UTF8) may write BOM (0xEF 0xBB 0xBF); strip it so "1" matches
-	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
-	s := strings.TrimSpace(string(data))
-	switch s {
-	case "1":
-		return ConfirmResult{Approved: true}, nil
-	case "allow_prefix":
-		return ConfirmResult{Approved: true, AllowPrefix: true}, nil
-	default:
-		return ConfirmResult{}, nil
+	content := highlightMatchedKeywordsInHTML(sqlHighlightHTML(req.SQL), highlightTermsForReview(req))
+	if err := os.WriteFile(htmlPath, []byte(content), 0600); err != nil {
+		return "", fmt.Errorf("confirm: write highlighted SQL content: %w", err)
 	}
+	return "html", nil
 }
 
 func buildConfirmHeader(req *ConfirmRequest) string {
@@ -494,7 +478,13 @@ func truncateSQL(sql string, maxLen int) string {
 
 // ps1Script is the PowerShell script for the confirmation form (WebBrowser with HTML syntax-highlighted SQL).
 const ps1Script = `
-param([string]$HtmlPath, [string]$ResultPath, [string]$HeaderPath, [string]$DangerKeywordsPath, [string]$WhitelistPath, [string]$WhitelistConnection, [string]$Connection = "default", [string]$HeaderColor = "A5D6A7")
+param([string]$HtmlPath, [string]$SqlPath, [string]$RenderMode = "html", [string]$SignalPath, [string]$ResultPath, [string]$HeaderPath, [string]$DangerKeywordsPath, [string]$WhitelistPath, [string]$WhitelistConnection, [string]$Connection = "default", [string]$HeaderColor = "A5D6A7")
+$ErrorActionPreference = 'Stop'
+$dialogClock = [Diagnostics.Stopwatch]::StartNew()
+function Write-DialogStage([string]$stage) {
+	if ($SignalPath) { try { [IO.File]::AppendAllText($SignalPath, $stage + ' ' + $dialogClock.ElapsedMilliseconds + [Environment]::NewLine) } catch {} }
+}
+Write-DialogStage 'PROCESS_READY'
 $Header = if (Test-Path $HeaderPath) { [System.IO.File]::ReadAllText($HeaderPath, [System.Text.Encoding]::UTF8) } else { "Confirm SQL execution" }
 $DangerKeywords = @()
 if (Test-Path $DangerKeywordsPath) {
@@ -627,7 +617,6 @@ function Save-WhitelistPrefix([string]$path, [string]$connectionName, [string]$p
 	[System.IO.File]::WriteAllText($path, $json + [Environment]::NewLine, $utf8NoBom)
 }
 
-$fileUri = [Uri]::new("file:///" + $HtmlPath.Replace('\', '/').Replace(' ', '%20'))
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Confirm SQL — " + $Connection
 $form.Size = New-Object System.Drawing.Size(1000, 780)
@@ -652,14 +641,37 @@ if ($Connection -and $Connection -ne "default") {
 $headerPanel.Controls.Add($lbl)
 $form.Controls.Add($headerPanel)
 
-$browser = New-Object System.Windows.Forms.WebBrowser
+$script:ContentReady = $false
+if ($RenderMode -eq 'plain') {
+	$browser = New-Object System.Windows.Forms.RichTextBox
+	$browser.ReadOnly = $true
+	$browser.WordWrap = $false
+	$browser.DetectUrls = $false
+	$browser.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Both
+	$browser.Font = New-Object System.Drawing.Font('Consolas', 10)
+	$browser.BackColor = [System.Drawing.Color]::White
+	$browser.MaxLength = [int]::MaxValue
+	$browser.Text = [IO.File]::ReadAllText($SqlPath, [Text.Encoding]::UTF8)
+	$script:ContentReady = $true
+	Write-DialogStage 'CONTENT_READY'
+} else {
+	$browser = New-Object System.Windows.Forms.WebBrowser
+	$browser.ScrollBarsEnabled = $true
+	$browser.IsWebBrowserContextMenuEnabled = $false
+	$browser.ScriptErrorsSuppressed = $true
+	$browser.Add_DocumentCompleted({
+		if ($browser.ReadyState -eq [System.Windows.Forms.WebBrowserReadyState]::Complete) {
+			$script:ContentReady = $true
+			if ($null -ne $btnExecute) { $btnExecute.Enabled = $true; $btnAllowPrefix.Enabled = $true }
+			Write-DialogStage 'CONTENT_READY'
+		}
+	})
+	$fileUri = [Uri]::new("file:///" + $HtmlPath.Replace('\', '/').Replace(' ', '%20'))
+	$browser.Navigate($fileUri.AbsoluteUri)
+}
 $browser.Location = New-Object System.Drawing.Point(10, 42)
 $browser.Size = New-Object System.Drawing.Size(965, 618)
 $browser.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-$browser.ScrollBarsEnabled = $true
-$browser.IsWebBrowserContextMenuEnabled = $false
-$browser.ScriptErrorsSuppressed = $true
-$browser.Navigate($fileUri.AbsoluteUri)
 
 $txtKeyword = New-Object System.Windows.Forms.TextBox
 $txtKeyword.Location = New-Object System.Drawing.Point(10, 670)
@@ -674,6 +686,7 @@ $btnAllowKeyword.Location = New-Object System.Drawing.Point(480, 670)
 $btnAllowKeyword.Size = New-Object System.Drawing.Size(100, 28)
 $btnAllowKeyword.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $btnAllowKeyword.Add_Click({
+	Write-DialogStage 'CLICK_ALLOW_KEYWORD'
 	if ([string]::IsNullOrWhiteSpace($txtKeyword.Text)) {
 		[System.Windows.Forms.MessageBox]::Show("Please enter a keyword first.", "Allow Keyword", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
 		return
@@ -708,6 +721,7 @@ $btnAllowPrefix.Location = New-Object System.Drawing.Point(590, 670)
 $btnAllowPrefix.Size = New-Object System.Drawing.Size(100, 28)
 $btnAllowPrefix.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $btnAllowPrefix.Add_Click({
+	Write-DialogStage 'CLICK_ALLOW_PREFIX'
 	if ([string]::IsNullOrWhiteSpace($txtKeyword.Text)) {
 		[System.Windows.Forms.MessageBox]::Show("Please enter a prefix first.", "Allow Prefix", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
 		return
@@ -733,6 +747,9 @@ $btnExecute.Location = New-Object System.Drawing.Point(700, 670)
 $btnExecute.Size = New-Object System.Drawing.Size(90, 28)
 $btnExecute.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $btnExecute.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$btnExecute.Add_Click({ Write-DialogStage 'CLICK_EXECUTE' })
+$btnExecute.Enabled = $script:ContentReady
+$btnAllowPrefix.Enabled = $script:ContentReady
 # Do not set AcceptButton/CancelButton so keyboard focus is not on any button (avoids accidental approve while typing)
 $form.Controls.Add($btnExecute)
 
@@ -742,13 +759,19 @@ $btnCancel.Location = New-Object System.Drawing.Point(800, 670)
 $btnCancel.Size = New-Object System.Drawing.Size(90, 28)
 $btnCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$btnCancel.Add_Click({ Write-DialogStage 'CLICK_CANCEL' })
 $form.Controls.Add($btnCancel)
 
 $form.Controls.Add($browser)
 $form.Controls.SetChildIndex($browser, 1)
 # Put focus on the SQL content (browser), not on Execute/Cancel, so user typing does not trigger a button
-$form.Add_Shown({ $form.ActiveControl = $browser })
-$result = $form.ShowDialog()
+$heartbeat = New-Object System.Windows.Forms.Timer
+$heartbeat.Interval = 5000
+$heartbeat.Add_Tick({ Write-DialogStage 'UI_HEARTBEAT' })
+$form.Add_Shown({ $form.ActiveControl = $browser; Write-DialogStage 'UI_SHOWN'; $heartbeat.Start() })
+$form.Add_FormClosed({ $heartbeat.Stop(); Write-DialogStage 'UI_CLOSED' })
+Write-DialogStage 'UI_CREATED'
+try { $result = $form.ShowDialog() } finally { $heartbeat.Dispose(); $form.Dispose() }
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 if ($form.Tag -eq "allow_prefix") { [IO.File]::WriteAllText($ResultPath, "allow_prefix", $utf8NoBom) }
 elseif ($result -eq [System.Windows.Forms.DialogResult]::OK) { [IO.File]::WriteAllText($ResultPath, "1", $utf8NoBom) }

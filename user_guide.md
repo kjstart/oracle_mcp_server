@@ -4,6 +4,8 @@
 
 # Oracle MCP Server — User Guide
 
+v2.0.2: isolated confirmation files, responsive native viewing for large Windows SQL, stage diagnostics in `error.log`, and updated agent guidance for automatic connection recovery.
+
 Version 2.0.0 defaults to lazy connections: startup/listing open no connections; every database operation checks/reconnects its selected SSH tunnel and database before sending SQL. Existing executable paths can remain unchanged when upgrading.
 
 **Author:** [Alvin Liu ](https://alvinliu.com)
@@ -49,7 +51,7 @@ This guide assumes you have downloaded the release zip containing the binary for
 
 2. **Edit config.yaml**
    - Open `config.yaml` in any text editor.
-   - Configure **oracle.connections** (required, at least one entry). Each key is a name you use in `execute_sql` as the `connection` argument; call `list_connections` to see names.
+   - Configure **oracle.connections** (required, at least one entry). Each key is a name you use in `execute_sql` as the `connection` argument; discover names with `list_connections` only when they are unknown.
 
    ```yaml
    oracle:
@@ -147,7 +149,7 @@ This guide assumes you have downloaded the release zip containing the binary for
 
 4. **Verify**
    - If Oracle-related MCP tools (`execute_sql`, `execute_sql_file`, `list_connections`, `query_to_csv_file`, `query_to_text_file`) appear in your chat, the setup is working
-   - With multiple databases: call `list_connections` to see names, then use `execute_sql` (or other tools) with `"connection": "database1"` (or the name you configured) to run SQL on a specific database
+   - With multiple databases: reuse the known connection name; only call `list_connections` when the name is unknown. Use `execute_sql` (or other tools) with `"connection": "database1"` (or the name you configured) to run SQL on a specific database
 
 ---
 
@@ -195,6 +197,8 @@ Usually a single database tool call is enough after an idle SSH tunnel disconnec
 
 通常只需调用一次数据库操作：MCP 会在发送 SQL 前自行恢复失效的 SSH 隧道和数据库连接，再执行 SQL。连接准备失败时，修复原因后重新调用相同操作即可，无需先列出连接。若 SQL 已经发送后才断线，写操作应先确认执行结果再手动重试。
 
+Agent 提示词应复用用户或当前对话中已知的连接名；仅在名称未知或明确需要查看最近诊断时调用 `list_connections`。请删除旧的“每次查询先列连接”或“查询失败先列连接以触发重连”指令。默认 lazy 模式下列连接不做实时检查，也不触发恢复。客户端另行维护的提示词或缓存的工具描述需要相应更新。
+
 | 参数 | 含义 | 默认值 |
 |---|---|---|
 | `oracle.lazy_mode` | 延迟建立连接，并在每次操作前检查、恢复所选连接 | `true` |
@@ -227,6 +231,12 @@ oracle:
 | `DATABASE_CONNECT_FAILED` | Oracle listener、service name、数据库认证；另看 SSH 是否正常 |
 
 SSH/连接错误写到独立的 `logging.error_log_file`（默认 `error.log`）及 stderr，不依赖 audit 开关。SQL audit 仅记录操作及连接不可用的通用结果，不包含 SSH 诊断详情。错误日志不记录数据库 DSN 或密码。
+
+确认窗口每次使用带 PID 和随机后缀的独立临时目录，多份 Codex/Claude MCP 进程不会覆盖对方的内容和审批结果。Windows 下 SQL 大于 64 KiB，或换行数至少 1,000 时，使用原生只读文本控件显示完整内容，避免大型高亮 HTML 渲染；较小的 SQL 保留语法高亮。
+
+同一 `error.log` 现在也记录阶段诊断，包含 MCP PID、request ID、连接名和耗时，时间戳明确标注 UTC。重点查看 `REQUEST_RECEIVED` → `CONFIRM_START` → `CONFIRM_PROCESS_STARTED` → `CONFIRM_UI_STAGE` → `CONFIRM_END` → `CONNECTION_CHECK_START` → `SQL_START` / `SQL_END`。确认过程中每 10 秒记录一次 `CONFIRM_WAIT`，其中 `ui_signal_age_ms` 是距离最近 UI 心跳/事件的时间；长期没有新信号提示需要检查窗口消息循环，不能仅凭等待时长认定卡死。阶段日志不记录 SQL 正文。
+
+窗口进程失败、审批结果文件缺失或无效会明确返回确认错误，不再误报用户取消。正常等待用户决定不设自动审批期限，也不会自动批准 SQL。
 
 | Symptom | Likely cause | What to do |
 |--------|----------------|------------|
@@ -384,7 +394,7 @@ SSH/连接错误写到独立的 `logging.error_log_file`（默认 `error.log`）
 
 4. **验证**
    - 若对话中出现 Oracle 相关 MCP 工具（`execute_sql`、`execute_sql_file`、`list_connections`、`query_to_csv_file`、`query_to_text_file`），说明配置成功
-   - 多数据库时：先调用 `list_connections` 查看名称，再在 `execute_sql` 等工具中传入 `"connection": "database1"`（或你配置的名称）对指定库执行
+   - 多数据库时：已知连接名就直接使用，只有未知时才调用 `list_connections`；在 `execute_sql` 等工具中传入 `"connection": "database1"`（或你配置的名称）对指定库执行
 
 ---
 

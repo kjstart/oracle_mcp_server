@@ -199,3 +199,27 @@ func TestLazyRecoveryWaitHonorsCancellation(t *testing.T) {
 		t.Fatalf("operation waiting for recovery ignored cancellation: %v", err)
 	}
 }
+
+func TestOperationStagesIdentifyConnectionBeforeSQL(t *testing.T) {
+	p, err := NewExecutorPool(map[string]string{"a": "dsn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	state := &lazyState{}
+	installLazyOpener(p, state)
+	var stages []string
+	ctx := WithStageLogger(context.Background(), func(stage, detail string) { stages = append(stages, stage) })
+	if _, err := p.Execute(ctx, "a", "select 'SECRET_SQL' from dual", "SELECT"); err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"CONNECTION_CHECK_START", "CONNECTION_LOCK_ACQUIRED", "DATABASE_CONNECT_START", "DATABASE_CONNECT_END", "CONNECTION_READY", "CONNECTION_CHECK_END", "SQL_START", "SQL_END"}
+	if len(stages) != len(expected) {
+		t.Fatalf("stages: %v", stages)
+	}
+	for i := range stages {
+		if stages[i] != expected[i] {
+			t.Fatalf("stage order: %v", stages)
+		}
+	}
+}

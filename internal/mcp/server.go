@@ -28,7 +28,7 @@ var McpSchemaRev = "TWNwU2N"
 var ProtocolBuild = "xWMg=="
 
 // Version is set from the executable's release metadata before serving requests.
-var Version = "2.0.0"
+var Version = "2.0.2"
 
 // JSON-RPC 2.0 structures
 type jsonRPCRequest struct {
@@ -135,14 +135,15 @@ const (
 
 // Server is the MCP server implementation.
 type Server struct {
-	errorLogFile *os.File
-	closeOnce    sync.Once
-	config       *config.Config
-	executorPool *oracle.ExecutorPool
-	analyzers    map[string]*sqlanalyzer.Analyzer // connection name -> analyzer built from that connection's security profile
-	confirmer    *confirm.Confirmer
-	auditor      *audit.Auditor
-	whitelist    *reviewwhitelist.Store
+	errorLogFile  *os.File
+	diagnosticLog *log.Logger
+	closeOnce     sync.Once
+	config        *config.Config
+	executorPool  *oracle.ExecutorPool
+	analyzers     map[string]*sqlanalyzer.Analyzer // connection name -> analyzer built from that connection's security profile
+	confirmer     *confirm.Confirmer
+	auditor       *audit.Auditor
+	whitelist     *reviewwhitelist.Store
 
 	reader *bufio.Reader
 	writer io.Writer
@@ -193,7 +194,8 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			errorFile.Close()
 		}
 	}()
-	executorPool, err := oracle.NewExecutorPool(connections, oracle.PoolOptions{SSH: cfg.SSHConnections(), ErrorLog: log.New(errorFile, "", log.LstdFlags|log.LUTC), Eager: !cfg.Oracle.LazyMode})
+	diagnosticLog := log.New(errorFile, "UTC ", log.LstdFlags|log.LUTC)
+	executorPool, err := oracle.NewExecutorPool(connections, oracle.PoolOptions{SSH: cfg.SSHConnections(), ErrorLog: diagnosticLog, Eager: !cfg.Oracle.LazyMode})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Oracle executor pool: %w", err)
 	}
@@ -228,15 +230,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	ready = true
 	return &Server{
-		errorLogFile: errorFile,
-		config:       cfg,
-		executorPool: executorPool,
-		analyzers:    analyzers,
-		confirmer:    confirm.NewConfirmer(),
-		auditor:      auditor,
-		whitelist:    reviewwhitelist.NewStore(whitelistPath),
-		reader:       bufio.NewReader(os.Stdin),
-		writer:       os.Stdout,
+		errorLogFile:  errorFile,
+		diagnosticLog: diagnosticLog,
+		config:        cfg,
+		executorPool:  executorPool,
+		analyzers:     analyzers,
+		confirmer:     confirm.NewConfirmer(),
+		auditor:       auditor,
+		whitelist:     reviewwhitelist.NewStore(whitelistPath),
+		reader:        bufio.NewReader(os.Stdin),
+		writer:        os.Stdout,
 	}, nil
 }
 
@@ -376,7 +379,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 		Tools: []tool{
 			{
 				Name:        "execute_sql",
-				Description: "Execute SQL against an Oracle database. Always pass the 'connection' argument with a configured connection name (call list_connections to see names). Supports SELECT, INSERT, UPDATE, DELETE, DDL (CREATE, DROP, ALTER, etc.), and multiple statements. Multiple statements: one per line, each line ending with a semicolon. DDL is auto-committed. SQL that matches config danger_keywords will open a confirmation window showing the full SQL. Do not specify schema-qualified object names such as hr.employees.",
+				Description: "Execute SQL against an Oracle database. Always pass the 'connection' argument; reuse the connection name already supplied by the user or known in this conversation. Each operation checks and restores its SSH/database connection before sending SQL; no preliminary connection-listing call is needed. Supports SELECT, INSERT, UPDATE, DELETE, DDL (CREATE, DROP, ALTER, etc.), and multiple statements. Multiple statements: one per line, each line ending with a semicolon. DDL is auto-committed. SQL that matches config danger_keywords will open a confirmation window showing the full SQL. Do not specify schema-qualified object names such as hr.employees.",
 				InputSchema: inputSchema{
 					Type: "object",
 					Properties: map[string]property{
@@ -386,7 +389,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use (e.g. 'database1', 'database2'). Required for every call; use list_connections to see names.",
+							Description: connectionArgumentDescription,
 						},
 					},
 					Required: []string{"sql"},
@@ -404,7 +407,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use. Required for every call; use list_connections to see names.",
+							Description: connectionArgumentDescription,
 						},
 					},
 					Required: []string{"file_path"},
@@ -412,7 +415,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 			},
 			{
 				Name:        "list_connections",
-				Description: "List configured Oracle connections and last-known diagnostics. Default lazy_mode: listing does not open or probe SSH/database connections; available=true means configured, not verified reachable. Inspect connection_checked, ssh_enabled, ssh_connected, database_connected, error_code, last_error and user_action. Each database operation checks its selected connection and reconnects before execution. On SSH errors, ask the user to check the jump host/settings. With lazy_mode=false, listing also retries failed connections.",
+				Description: "Discover configured connection names only when unknown, or inspect last-known diagnostics when requested. Do not call before every query or as a recovery step after query errors: each database operation checks/reconnects its selected connection automatically. Default lazy_mode: listing opens no SSH/database connections and cannot trigger reconnection; available=true means configured, not verified reachable. Diagnostics include connection_checked, ssh_enabled, ssh_connected, database_connected, error_code, last_error and user_action. With lazy_mode=false listing also retries failed connections, but database operations still recover independently.",
 				InputSchema: inputSchema{
 					Type:       "object",
 					Properties: map[string]property{},
@@ -435,7 +438,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use. Required for every call; use list_connections to see names.",
+							Description: connectionArgumentDescription,
 						},
 					},
 					Required: []string{"sql", "file_path"},
@@ -457,7 +460,7 @@ func (s *Server) handleToolsList(req *jsonRPCRequest) {
 						},
 						"connection": {
 							Type:        "string",
-							Description: "Which configured database to use. Required for every call; use list_connections to see names.",
+							Description: connectionArgumentDescription,
 						},
 					},
 					Required: []string{"sql", "file_path"},
@@ -475,6 +478,10 @@ func (s *Server) handleToolsCall(req *jsonRPCRequest) {
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		s.sendError(req.ID, ErrCodeInvalidParams, "Invalid params", nil)
 		return
+	}
+	if params.Name == "execute_sql" || params.Name == "execute_sql_file" || params.Name == "query_to_csv_file" || params.Name == "query_to_text_file" {
+		connection, _ := params.Arguments["connection"].(string)
+		s.stageLogger(req, connection)("REQUEST_RECEIVED", fmt.Sprintf("tool=%q", params.Name))
 	}
 
 	switch params.Name {
@@ -595,7 +602,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 			ReviewTriggerDetails:        formatReviewTriggerDetails(unresolvedMatches),
 			DangerKeywords:              security.DangerKeywords,
 		}
-		confirmResult, err := s.confirmer.Confirm(confirmReq)
+		confirmResult, err := s.confirmSQL(req, confirmReq)
 		if err != nil {
 			s.logAudit(sql, analysis.MatchedKeywords, audit.ApprovalRejected, "CONFIRM_ERROR: "+err.Error(), displayConnection, nil)
 			s.sendToolError(req.ID, fmt.Sprintf("Confirmation dialog error: %v", err))
@@ -640,7 +647,7 @@ func (s *Server) tryConfirmDangerousSQL(req *jsonRPCRequest, sql, displayConnect
 		WhitelistConnection:         connectionKey,
 		DangerKeywords:              security.DangerKeywords,
 	}
-	confirmResult, err := s.confirmer.Confirm(confirmReq)
+	confirmResult, err := s.confirmSQL(req, confirmReq)
 	if err != nil {
 		s.logAudit(sql, analysis.MatchedKeywords, audit.ApprovalRejected, "CONFIRM_ERROR: "+err.Error(), displayConnection, nil)
 		s.sendToolError(req.ID, fmt.Sprintf("Confirmation dialog error: %v", err))
@@ -705,7 +712,8 @@ func (s *Server) handleExecuteSQL(req *jsonRPCRequest, args map[string]interface
 	}
 
 	// Execute the SQL on the chosen connection
-	ctx := context.Background()
+	ctx, finish := s.operationContext(req, displayConnection)
+	defer finish()
 	result, err := s.executorPool.Execute(ctx, connectionName, sql, review.stmtType)
 	if err != nil {
 		// Approved=true: execution was attempted after passing confirmation (or confirmation was not required).
@@ -789,7 +797,8 @@ func (s *Server) handleExecuteSQLFile(req *jsonRPCRequest, args map[string]inter
 		return
 	}
 
-	ctx := context.Background()
+	ctx, finish := s.operationContext(req, displayConnection)
+	defer finish()
 	result, err := s.executorPool.Execute(ctx, connectionName, sql, review.stmtType)
 	if err != nil {
 		s.logAudit(sql, review.auditKeywords, review.approval, "EXECUTION_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))
@@ -817,8 +826,10 @@ func (s *Server) handleExecuteSQLFile(req *jsonRPCRequest, args map[string]inter
 	s.sendToolResult(req.ID, string(resultJSON))
 }
 
-// handleListConnections handles the list_connections tool.
-// It retries previously failed connections and returns each connection with its availability status.
+const connectionArgumentDescription = "Configured database connection name, required for every call. Reuse the name supplied by the user or already known in this conversation. Discover names only when unknown; listing connections is not a prerequisite or a recovery step."
+
+// handleListConnections reports configured names and last-known status. Lazy
+// listing performs no network I/O; eager listing additionally retries failures.
 func (s *Server) handleListConnections(req *jsonRPCRequest) {
 	statuses := s.executorPool.ListConnectionsWithStatus()
 	out := map[string]interface{}{
@@ -832,9 +843,9 @@ func (s *Server) handleListConnections(req *jsonRPCRequest) {
 
 func connectionListingMessage(lazy bool) string {
 	if lazy {
-		return "Lazy mode: all configured connections are available for use, but availability is not a reachability check. Listing opens no SSH/database connections. Inspect connection_checked and last-known diagnostics. Each database operation checks/reconnects only its selected connection before SQL is executed; SQL is never replayed. SSH failures include user_action and are logged in the connectivity error log."
+		return "Lazy mode: this listing discovers configured names and reports last-known diagnostics only. It does not test live connectivity or trigger reconnection; available=true means configured. When a connection name is already known, execute the database operation directly without listing first. On connection errors, resolve the reported cause and retry the original operation when safe; that operation checks/reconnects automatically. Never blindly repeat a write whose outcome is uncertain."
 	}
-	return "Eager mode: startup connects to configured databases, SSH connections recover in the background, and this listing retries failed connections. Each database operation also checks/reconnects its selected connection. Inspect last-known diagnostics and user_action."
+	return "Eager mode: this listing shows configured names and diagnostics and also retries failed connections. Use it to discover unknown names or inspect diagnostics when requested, not before every query. Each database operation independently checks/reconnects its selected connection, so listing is not required to recover from an error."
 }
 
 // handleQueryToCSVFile handles the query_to_csv_file tool. Same danger/DDL review as execute_sql; file_path must be absolute.
@@ -888,7 +899,8 @@ func (s *Server) handleQueryToCSVFile(req *jsonRPCRequest, args map[string]inter
 		return
 	}
 
-	ctx := context.Background()
+	ctx, finish := s.operationContext(req, displayConnection)
+	defer finish()
 	rowsWritten, err := s.executorPool.ExecuteToCSVFile(ctx, connectionName, sqlStr, filePath)
 	if err != nil {
 		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_CSV_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))
@@ -957,7 +969,8 @@ func (s *Server) handleQueryToTextFile(req *jsonRPCRequest, args map[string]inte
 		return
 	}
 
-	ctx := context.Background()
+	ctx, finish := s.operationContext(req, displayConnection)
+	defer finish()
 	rowsWritten, err := s.executorPool.ExecuteToTextFile(ctx, connectionName, sqlStr, filePath)
 	if err != nil {
 		s.logAudit(sqlStr, review.auditKeywords, review.approval, "QUERY_TO_TEXT_ERROR: "+auditExecutionError(err), displayConnection, reviewHeaderLineOption(review))

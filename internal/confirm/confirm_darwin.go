@@ -16,6 +16,7 @@ import (
 
 // ConfirmRequest contains the data for a confirmation dialog.
 type ConfirmRequest struct {
+	LogStage                    func(stage, detail string)
 	SQL                         string
 	MatchedKeywords             []string
 	DisplayKeywords             []string
@@ -48,7 +49,12 @@ func NewConfirmer() *Confirmer {
 
 // Confirm shows a confirmation dialog using JXA and returns the approval result.
 func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
-	sqlDir := os.TempDir()
+	sqlDir, err := newDialogDir()
+	if err != nil {
+		return ConfirmResult{}, fmt.Errorf("confirm: create private temporary directory: %w", err)
+	}
+	defer os.RemoveAll(sqlDir)
+	req.trace("CONFIRM_TEMP_READY", fmt.Sprintf("directory=%q", sqlDir))
 	resultPath := filepath.Join(sqlDir, "oracle-mcp-confirm-result.txt")
 	scriptPath := filepath.Join(sqlDir, "oracle-mcp-confirm-dialog.js")
 	headerPath := filepath.Join(sqlDir, "oracle-mcp-confirm-header.txt")
@@ -108,15 +114,11 @@ func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
 
 	cmd := exec.Command("osascript", "-l", "JavaScript", scriptPath,
 		headerPath, sqlPath, resultPath, req.WhitelistPath, req.WhitelistConnection, dangerKeywordsPath, connectionArg, headerColor, highlightTermsPath)
-	output, err := cmd.Output()
-	if result, ok := readConfirmResultFile(resultPath); ok {
-		return result, nil
-	}
+	req.trace("CONFIRM_CONTENT_PREPARED", fmt.Sprintf("mode=native sql_bytes=%d sql_lines=%d", len(req.SQL), strings.Count(req.SQL, "\n")+1))
+	output, err := runDialog(req, cmd, "")
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 1 || strings.Contains(string(exitErr.Stderr), "-128") {
-				return ConfirmResult{}, nil
-			}
+		if strings.Contains(err.Error(), "-128") {
+			return ConfirmResult{}, nil
 		}
 		return ConfirmResult{}, fmt.Errorf("dialog error: %w", err)
 	}
@@ -124,7 +126,7 @@ func (c *Confirmer) Confirm(req *ConfirmRequest) (ConfirmResult, error) {
 	if result, ok := parseConfirmResult(strings.TrimSpace(string(output))); ok {
 		return result, nil
 	}
-	return ConfirmResult{}, nil
+	return readDialogResult(resultPath)
 }
 
 func readConfirmResultFile(path string) (ConfirmResult, bool) {

@@ -1,6 +1,6 @@
 # Oracle MCP Server Makefile
 
-VERSION ?= 2.0.0
+VERSION ?= 2.0.2
 BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME)"
 

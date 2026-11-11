@@ -1,4 +1,4 @@
-# Oracle MCP Server v2.0.0 Configuration
+# Oracle MCP Server v2.0.2 Configuration
 # Copy this file to config.yaml and modify as needed
 # Author: Alvin Liu — https://alvinliu.com
 # Github: https://github.com/kjstart/cursor_oracle_mcp_server
@@ -79,5 +79,6 @@ logging:
 
   # Path to audit log file (relative to config directory or absolute path)
   log_file: "audit.log"
-  # SSH/connectivity errors only; separate from SQL audit log. Relative to config directory.
+  # Connectivity errors + request/dialog/connection/SQL stage diagnostics (no SQL text).
+  # Separate from SQL audit log, UTC timestamps, relative to config directory.
   error_log_file: "error.log"

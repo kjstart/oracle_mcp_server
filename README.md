@@ -19,6 +19,8 @@ A Model Context Protocol (MCP) server for Oracle Database, enabling AI assistant
 
 ## Features
 
+v2.0.2 fixes concurrent confirmation-file collisions, uses a native full-text view for large Windows SQL, adds request/UI/connection stage diagnostics, and removes obsolete agent guidance to list connections for recovery.
+
 - **v2.0.0 lazy connections**: `oracle.lazy_mode: true` by default; startup and connection listing open no SSH or database connections. Every database operation checks/reconnects its selected connection before SQL is sent.
 - **Independent bastion tunnels**: One SSH login to each connection's bastion, then TCP forwarding to the Oracle listener; no database-server SSH account/key. Connectivity diagnostics go to a separate `error.log`.
 
@@ -110,7 +112,7 @@ logging:
   log_file: "audit.log"  # Base name; actual files: audit_YYYY-MM-DD_HHMMSS.log, 10MB rotation
 ```
 
-Always pass the configured `connection` name to database tools, including when only one connection is configured. Use `list_connections` to discover names and last-known state.
+Always pass the configured `connection` name to database tools, including when only one connection is configured. Reuse connection names already supplied by the user or known in the conversation. Call `list_connections` only to discover unknown names or inspect last-known diagnostics when requested.
 
 **Multiple security profiles:** define named profiles under `security_profiles` (same fields as `security`; omitted fields use built-in defaults) and bind connections to them with `oracle.connection_security`. Connections not listed use the top-level `security` section (profile name `default`, which can also be referenced explicitly). Unknown profile or connection names are rejected at startup.
 
@@ -165,7 +167,13 @@ Normally one tool call is sufficient even after an idle tunnel disconnects: MCP 
 
 `list_connections` returns `lazy_mode` and includes `connection_checked`, `ssh_enabled`, `ssh_connected`, `database_connected`, `error_code`, `last_error`, and `user_action`, alongside `name` and `available`. In lazy mode every configured connection has `available: true` (configured for use, **not verified reachable**). Other fields are last-known diagnostics: an unused connection has `connection_checked: false`. Previously observed failures remain visible without causing a retry during listing. SQL tool errors also report an SSH cause when known. Error codes distinguish `SSH_CONFIG_ERROR`, `SSH_CONNECT_FAILED`, `SSH_DISCONNECTED`, `SSH_FORWARD_FAILED`, `SSH_LISTEN_FAILED`, `SSH_DSN_UNSUPPORTED`, and `DATABASE_CONNECT_FAILED`. AI clients should use `user_action` to help users check the appropriate settings.
 
+Agent instructions should reuse a connection name already supplied by the user or known in the conversation. Use `list_connections` only to discover unknown names or inspect last-known diagnostics when explicitly needed. Remove older prompts that require listing before each query or after a query failure to reconnect. Recovery runs inside the database operation; default lazy listing cannot reconnect anything. Changing the MCP's tool descriptions does not automatically update separately maintained client prompts or already cached tool metadata.
+
 Connectivity failures go to `logging.error_log_file` (default `error.log`, relative to the config directory) and stderr, independently of audit logging. Repeated identical failures are suppressed until their state changes. SQL audit records retain attempted operations but omit SSH diagnostic details. Database passwords and DSNs are not included in connectivity diagnostics.
+
+Confirmation dialogs use a separate PID/random temporary directory for every request, so concurrent Codex/Claude MCP processes cannot overwrite each other's SQL or approval result. Windows SQL larger than 64 KiB or at least 1,000 newline characters uses a read-only native text view with the full SQL; smaller statements keep syntax highlighting. Temporary files are removed after the dialog exits.
+
+The same diagnostic log records request/confirmation/connection/SQL stages with MCP PID, request ID, connection name and elapsed milliseconds. Windows dialogs emit content-ready, shown, button and heartbeat signals; while awaiting a decision, the parent logs `CONFIRM_WAIT` every 10 seconds with the last UI signal age. Timestamps are explicitly marked UTC. SQL text is excluded from these stage logs. Process failures and missing/invalid approval results return a confirmation error instead of being classified as user cancellation. Waiting for the user has no approval deadline and never auto-approves.
 
 SSH currently supports a **single TCP Easy Connect** database DSN (`host:port/service`). TNS aliases, TCPS/wallets, multi-host descriptors and RAC/SCAN redirection are not supported. The Oracle Instant Client requirement remains unchanged.
 
@@ -544,7 +552,7 @@ logging:
   log_file: "audit.log"
 ```
 
-数据库工具每次都需要传入已配置的 `connection` 名称，单连接也一样。用 `list_connections` 查看名称和最近状态。
+数据库工具每次都需要传入已配置的 `connection` 名称，单连接也一样。已知连接名时直接使用；仅在连接名未知或明确需要查看最近诊断时调用 `list_connections`。
 
 > **连接安全：** 首次启动时，`config.yaml` 中的明文连接串会被自动替换为加密值，文件原地更新，注释与格式完整保留。
 

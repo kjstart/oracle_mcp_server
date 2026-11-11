@@ -206,7 +206,9 @@ func (p *ExecutorPool) Execute(ctx context.Context, connectionName string, sqlTe
 		return nil, err
 	}
 
+	traceStage(ctx, "SQL_START", "")
 	result, err := ex.Execute(ctx, sqlText, statementType)
+	traceStage(ctx, "SQL_END", resultStatus(err))
 	if err != nil && p.isConnectionError(err) {
 		p.markConnectionFailed(name, ex)
 	}
@@ -239,7 +241,9 @@ func (p *ExecutorPool) ExecuteToCSVFile(ctx context.Context, connectionName stri
 	if err != nil {
 		return 0, err
 	}
+	traceStage(ctx, "EXPORT_START", "format=csv")
 	n, err := ex.ExecuteToCSVFile(ctx, sqlText, filePath)
+	traceStage(ctx, "EXPORT_END", resultStatus(err))
 	if err != nil && p.isConnectionError(err) {
 		p.markConnectionFailed(name, ex)
 	}
@@ -253,7 +257,9 @@ func (p *ExecutorPool) ExecuteToTextFile(ctx context.Context, connectionName str
 	if err != nil {
 		return 0, err
 	}
+	traceStage(ctx, "EXPORT_START", "format=text")
 	n, err := ex.ExecuteToTextFile(ctx, sqlText, filePath)
+	traceStage(ctx, "EXPORT_END", resultStatus(err))
 	if err != nil && p.isConnectionError(err) {
 		p.markConnectionFailed(name, ex)
 	}

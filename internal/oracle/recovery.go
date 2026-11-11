@@ -17,6 +17,11 @@ func (p *ExecutorPool) recoverConnection(name string) {
 // Demand operations wait for the per-connection recovery lock; background checks
 // skip busy connections. No SQL is executed or replayed by this method.
 func (p *ExecutorPool) recoverConnectionContext(parent context.Context, name string, wait bool) error {
+	started := time.Now()
+	traceStage(parent, "CONNECTION_CHECK_START", "")
+	defer func() {
+		traceStage(parent, "CONNECTION_CHECK_END", fmt.Sprintf("duration_ms=%d", time.Since(started).Milliseconds()))
+	}()
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	stop := context.AfterFunc(p.ctx, cancel)
@@ -36,6 +41,7 @@ func (p *ExecutorPool) recoverConnectionContext(parent context.Context, name str
 		return nil
 	}
 	defer r.mu.Unlock()
+	traceStage(parent, "CONNECTION_LOCK_ACQUIRED", fmt.Sprintf("wait_ms=%d", time.Since(started).Milliseconds()))
 	if p.ctx.Err() != nil {
 		return p.ctx.Err()
 	}
@@ -51,7 +57,10 @@ func (p *ExecutorPool) recoverConnectionContext(parent context.Context, name str
 	p.mu.RUnlock()
 	connected := true
 	if r.tunnel != nil {
-		connected = r.tunnel.Check(ctx) == nil
+		traceStage(ctx, "SSH_CHECK_START", "")
+		err := r.tunnel.Check(ctx)
+		connected = err == nil
+		traceStage(ctx, "SSH_CHECK_END", resultStatus(err))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -59,9 +68,12 @@ func (p *ExecutorPool) recoverConnectionContext(parent context.Context, name str
 	if ex != nil {
 		if connected {
 			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+			traceStage(ctx, "DATABASE_PING_START", "")
 			err := ex.TestConnection(pingCtx)
+			traceStage(ctx, "DATABASE_PING_END", resultStatus(err))
 			pingCancel()
 			if err == nil {
+				traceStage(ctx, "CONNECTION_READY", "reused=true")
 				return nil
 			}
 		}
@@ -86,17 +98,21 @@ func (p *ExecutorPool) recoverConnectionContext(parent context.Context, name str
 			r.tunnel = tunnel
 			p.mu.Unlock()
 		}
-		if err := r.tunnel.Connect(ctx); err != nil {
+		traceStage(ctx, "SSH_CONNECT_START", "")
+		err := r.tunnel.Connect(ctx)
+		traceStage(ctx, "SSH_CONNECT_END", resultStatus(err))
+		if err != nil {
 			return p.unavailableError(name)
 		}
-		var err error
 		databaseDSN, err = tunnelDSN(original, r.tunnel.Address())
 		if err != nil {
 			p.recordFailure(name, "SSH_DSN_UNSUPPORTED", err.Error())
 			return p.unavailableError(name)
 		}
 	}
+	traceStage(ctx, "DATABASE_CONNECT_START", "")
 	ex, err := p.open(ctx, databaseDSN)
+	traceStage(ctx, "DATABASE_CONNECT_END", resultStatus(err))
 	if err != nil {
 		if r.tunnel != nil {
 			if _, code, _ := r.tunnel.Status(); code != "" {
@@ -116,6 +132,7 @@ func (p *ExecutorPool) recoverConnectionContext(parent context.Context, name str
 	delete(p.failed, name)
 	r.errorCode, r.lastError = "", ""
 	p.mu.Unlock()
+	traceStage(ctx, "CONNECTION_READY", "reused=false")
 	return nil
 }
 
@@ -184,7 +201,7 @@ type ConnectivityError struct {
 }
 
 func (e *ConnectivityError) Error() string {
-	return fmt.Sprintf("connection %q unavailable [%s]: %s. %s Call list_connections for current status", e.Connection, e.Code, e.Detail, e.UserAction)
+	return fmt.Sprintf("connection %q unavailable [%s]: %s. %s Connection checks and recovery run automatically before each database operation. If a write may already have been submitted, verify its outcome before retrying.", e.Connection, e.Code, e.Detail, e.UserAction)
 }
 
 func (p *ExecutorPool) connectionError(name string, err error) error {
